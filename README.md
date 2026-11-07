@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="art/logo.png" width="160" alt="ClaudeSpoof logo" />
+</p>
+
 # ClaudeSpoof — Claude 安卓端时区 / 语言伪装模块
 
 基于 Claude **1.261104.19**（versionCode 26110419）逆向分析编写的 LSPosed 模块，
@@ -82,6 +86,7 @@ v1.2 起读取改为**双通道**：`XSharedPreferences` 与 `ContentProvider`
 
 ## 版本历史
 
+- **v1.4.1**：新 LOGO——戴上假鼻子胡子墨镜的橙色太阳花（自适应图标，Android 12+ 随主题取色）。
 - **v1.4**：设置界面 Material 3 重设计（AppBar + 卡片 + 描边输入框 + MaterialSwitch，Android 12+ 动态取色）。
 - **v1.3**：配置读取双通道、per-app 语言 API 补全。
 - **v1.1**：加入设置界面。
