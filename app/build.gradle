@@ -2,9 +2,27 @@ plugins {
     id 'com.android.application'
 }
 
+// 本地签名配置（keystore.properties 不入库；没有该文件时构建未签名的 release）
+def keystorePropsFile = rootProject.file('keystore.properties')
+def keystoreProps = new Properties()
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withReader('UTF-8') { keystoreProps.load(it) }
+}
+
 android {
     namespace 'com.arin.claudespoof'
     compileSdk 34
+
+    signingConfigs {
+        release {
+            if (keystorePropsFile.exists()) {
+                storeFile file(keystoreProps['storeFile'])
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+            }
+        }
+    }
 
     defaultConfig {
         applicationId "com.arin.claudespoof"
@@ -17,6 +35,9 @@ android {
     buildTypes {
         release {
             minifyEnabled false
+            if (keystorePropsFile.exists()) {
+                signingConfig signingConfigs.release
+            }
         }
     }
     compileOptions {
