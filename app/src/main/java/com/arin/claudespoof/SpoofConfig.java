@@ -19,10 +19,22 @@ public final class SpoofConfig {
     public static final String KEY_TIMEZONE = "timezone";
     public static final String KEY_LANGUAGE = "language";
 
-    /** 兜底默认值 */
+    /** v1.5：运营商 / SIM 伪装（数据来源：对 Claude 1.261109.19 的静态分析） */
+    public static final String KEY_COUNTRY = "country";
+    public static final String KEY_CARRIER_NAME = "carrier_name";
+    public static final String KEY_MCCMNC = "mccmnc";
+    public static final String KEY_CARRIER_ID = "carrier_id";
+
+    /** 兜底默认值（美东人设 + Verizon） */
     public static final boolean ENABLED = true;
     public static final String TIMEZONE_ID = "America/New_York";
     public static final String LANGUAGE_TAG = "en-US";
+
+    /** 兜底运营商（Verizon Wireless，carrierId 取自 AOSP carrier_list） */
+    public static final String COUNTRY = "US";
+    public static final String CARRIER_NAME = "Verizon Wireless";
+    public static final String MCCMNC = "311480";
+    public static final int CARRIER_ID = 1839;
 
     private SpoofConfig() {
     }

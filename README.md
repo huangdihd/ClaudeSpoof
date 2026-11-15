@@ -17,6 +17,8 @@
 4. 打开 ClaudeSpoof，设置：
    - **时区**：IANA 时区 ID，如 `America/New_York`（建议与代理出口一致）
    - **语言**：BCP-47 标签，如 `en-US`
+   - **运营商**：预设一键填充（Verizon / T-Mobile / AT&T / DoCoMo / SoftBank），
+     国家码、运营商名、MCC/MNC 均可自定义（v1.5 起）
    - **启用伪装**：总开关，关闭后 Claude 读到真实系统值
 5. 保存后约 5 秒内自动生效，一般无需重启 Claude；未生效就强杀重开。
 
@@ -72,6 +74,29 @@
 v1.2 起读取改为**双通道**：`XSharedPreferences` 与 `ContentProvider`
 （`content://com.arin.claudespoof.config/config`）互备，任一通道成功即采用。
 
+## 运营商 / SIM 伪装（v1.5 起）
+
+依据对 Claude **1.261109.19** 的静态分析（第三方 AI 逆向结论，SHA-256
+`e4003806…d63510b`），Claude 会读取并上传以下运营商元数据，本模块对应 hook
+`TelephonyManager` 的读取接口：
+
+| Claude 内用途 | 接口 | 模块伪装值 |
+| --- | --- | --- |
+| Sift 风控 `mobile_iso_country_code` | `getSimCountryIso()` | 国家码（如 US） |
+| Sift 风控 `mobile_carrier_name` | `getNetworkOperatorName()`、`getSimOperatorName()` | 运营商名 |
+| Google CCT 日志 `mcc_mnc` | `getSimOperator()` | MCC/MNC |
+| Plaid 组件 `mcc`/`mnc` | `getNetworkOperator()` | MCC/MNC |
+| 网络监测对象 | `getSimCarrierId()`、`getSimCarrierIdName()`（API 29+） | carrierId / 运营商名 |
+| 新账户 `network_country` | `getNetworkCountryIso()` | 国家码 |
+
+预设的 carrierId 取自 AOSP `carrier_list`（Verizon=1839、T-Mobile=1、
+AT&T=1187）；「自定义」预设返回 `-1`（unknown），与未收录运营商的真实行为一致。
+
+该 APK 未申请 `READ_PHONE_STATE` / `READ_PHONE_NUMBERS` / `READ_SMS`，
+也无 `getSubscriberId`（IMSI）、`getSimSerialNumber`（ICCID）、`getLine1Number`
+（手机号）、`getImei` 等调用，因此本模块同样不触碰这些高敏感标识——
+双方信息对等，才是完整的伪装。
+
 ## 构建
 
 1. Android Studio **Open** 打开本目录，同步后 **Build → Build APK(s)**。
@@ -86,6 +111,7 @@ v1.2 起读取改为**双通道**：`XSharedPreferences` 与 `ContentProvider`
 
 ## 版本历史
 
+- **v1.5.0**：运营商 / SIM 元数据伪装（TelephonyManager 八个接口），运营商预设下拉（Verizon / T-Mobile / AT&T / DoCoMo / SoftBank），依据 1.261109.19 静态分析覆盖 Sift / Plaid / CCT / ReportDeviceFacts 数据源。
 - **v1.4.1**：新 LOGO——戴上假鼻子胡子墨镜的橙色太阳花（自适应图标，Android 12+ 随主题取色）。
 - **v1.4**：设置界面 Material 3 重设计（AppBar + 卡片 + 描边输入框 + MaterialSwitch，Android 12+ 动态取色）。
 - **v1.3**：配置读取双通道、per-app 语言 API 补全。

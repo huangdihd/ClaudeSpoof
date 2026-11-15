@@ -49,6 +49,12 @@ public class MainHook implements IXposedHookLoadPackage {
     private volatile Locale spoofLocale = Locale.forLanguageTag(SpoofConfig.LANGUAGE_TAG);
     private volatile TimeZone spoofTz = TimeZone.getTimeZone(SpoofConfig.TIMEZONE_ID);
 
+    /** v1.5：运营商 / SIM 伪装值 */
+    private volatile String carrierCountry = SpoofConfig.COUNTRY;
+    private volatile String carrierName = SpoofConfig.CARRIER_NAME;
+    private volatile String mccMnc = SpoofConfig.MCCMNC;
+    private volatile int carrierId = SpoofConfig.CARRIER_ID;
+
     private String lastLogSignature = "";
     private final java.util.HashMap<String, Integer> dbgCounts = new java.util.HashMap<>();
 
@@ -90,6 +96,7 @@ public class MainHook implements IXposedHookLoadPackage {
         hookPerAppLocales();
         hookIcu();
         hookSystemProperties();
+        hookTelephonyManager();
     }
 
     /** 双通道读取配置；任一通道成功即采用，值变化时打日志 */
@@ -99,7 +106,8 @@ public class MainHook implements IXposedHookLoadPackage {
         lastReload = now;
 
         Boolean en = null;
-        String tz = null, lang = null, source = null;
+        String tz = null, lang = null, country = null, carrier = null, mcc = null, source = null;
+        Integer cid = null;
 
         // 通道一：XSharedPreferences
         try {
@@ -110,6 +118,10 @@ public class MainHook implements IXposedHookLoadPackage {
             en = prefs.getBoolean(SpoofConfig.KEY_ENABLED, SpoofConfig.ENABLED);
             tz = prefs.getString(SpoofConfig.KEY_TIMEZONE, SpoofConfig.TIMEZONE_ID);
             lang = prefs.getString(SpoofConfig.KEY_LANGUAGE, SpoofConfig.LANGUAGE_TAG);
+            country = prefs.getString(SpoofConfig.KEY_COUNTRY, SpoofConfig.COUNTRY);
+            carrier = prefs.getString(SpoofConfig.KEY_CARRIER_NAME, SpoofConfig.CARRIER_NAME);
+            mcc = prefs.getString(SpoofConfig.KEY_MCCMNC, SpoofConfig.MCCMNC);
+            cid = prefs.getInt(SpoofConfig.KEY_CARRIER_ID, SpoofConfig.CARRIER_ID);
             source = "xsp";
         } catch (Throwable ignored) {
         }
@@ -128,6 +140,10 @@ public class MainHook implements IXposedHookLoadPackage {
                         en = c.getInt(0) == 1;
                         tz = c.getString(1);
                         lang = c.getString(2);
+                        country = c.getString(3);
+                        carrier = c.getString(4);
+                        mcc = c.getString(5);
+                        cid = c.getInt(6);
                         source = "provider";
                     }
                 }
@@ -147,11 +163,17 @@ public class MainHook implements IXposedHookLoadPackage {
         if (en != null) enabled = en;
         if (tz != null && !tz.isEmpty()) tzId = tz;
         if (lang != null && !lang.isEmpty()) langTag = lang;
+        if (country != null && !country.isEmpty()) carrierCountry = country;
+        if (carrier != null && !carrier.isEmpty()) carrierName = carrier;
+        if (mcc != null && !mcc.isEmpty()) mccMnc = mcc;
+        if (cid != null) carrierId = cid;
         spoofLocale = Locale.forLanguageTag(langTag);
         spoofTz = TimeZone.getTimeZone(tzId);
 
-        logOnce(source + "|" + enabled + "|" + tzId + "|" + langTag,
-                "config <- " + source + ": enabled=" + enabled + " tz=" + tzId + " lang=" + langTag);
+        logOnce(source + "|" + enabled + "|" + tzId + "|" + langTag + "|" + carrierCountry
+                        + "|" + carrierName + "|" + mccMnc,
+                "config <- " + source + ": enabled=" + enabled + " tz=" + tzId + " lang=" + langTag
+                        + " country=" + carrierCountry + " carrier=" + carrierName + " mccmnc=" + mccMnc);
     }
 
     private void logOnce(String signature, String msg) {
@@ -362,6 +384,68 @@ public class MainHook implements IXposedHookLoadPackage {
                         }
                     }
                 });
+            }
+        });
+    }
+
+    /**
+     * v1.5：TelephonyManager 运营商 / SIM 元数据伪装。
+     * 依据对 Claude 1.261109.19 的静态分析，以下接口有真实调用并进入网络请求：
+     *  - getSimCountryIso / getNetworkCountryIso → Sift mobile_iso_country_code、Claude network_country
+     *  - getNetworkOperatorName（及 getSimOperatorName）→ Sift mobile_carrier_name
+     *  - getSimOperator / getNetworkOperator → Google CCT mcc_mnc、Plaid mcc/mnc
+     *  - getSimCarrierId / getSimCarrierIdName → 网络监测对象
+     * 不涉及 IMSI / ICCID / 手机号（APK 未申请相应权限，也未发现读取代码）。
+     */
+    private void hookTelephonyManager() {
+        safe("TelephonyManager", new Runnable() {
+            @Override
+            public void run() {
+                XC_MethodHook isoHook = new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        refreshConfig(false);
+                        if (enabled) param.setResult(carrierCountry);
+                    }
+                };
+                XC_MethodHook operatorHook = new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        refreshConfig(false);
+                        if (enabled) param.setResult(mccMnc);
+                    }
+                };
+                XC_MethodHook carrierNameHook = new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        refreshConfig(false);
+                        if (enabled) param.setResult(carrierName);
+                    }
+                };
+                XposedHelpers.findAndHookMethod(android.telephony.TelephonyManager.class,
+                        "getSimCountryIso", isoHook);
+                XposedHelpers.findAndHookMethod(android.telephony.TelephonyManager.class,
+                        "getNetworkCountryIso", isoHook);
+                XposedHelpers.findAndHookMethod(android.telephony.TelephonyManager.class,
+                        "getSimOperator", operatorHook);
+                XposedHelpers.findAndHookMethod(android.telephony.TelephonyManager.class,
+                        "getNetworkOperator", operatorHook);
+                XposedHelpers.findAndHookMethod(android.telephony.TelephonyManager.class,
+                        "getSimOperatorName", carrierNameHook);
+                XposedHelpers.findAndHookMethod(android.telephony.TelephonyManager.class,
+                        "getNetworkOperatorName", carrierNameHook);
+                if (Build.VERSION.SDK_INT >= 29) {
+                    XposedHelpers.findAndHookMethod(android.telephony.TelephonyManager.class,
+                            "getSimCarrierId", new XC_MethodHook() {
+                                @Override
+                                protected void afterHookedMethod(MethodHookParam param) {
+                                    refreshConfig(false);
+                                    if (enabled) param.setResult(carrierId);
+                                }
+                            });
+                    XposedHelpers.findAndHookMethod(android.telephony.TelephonyManager.class,
+                            "getSimCarrierIdName", carrierNameHook);
+                }
             }
         });
     }

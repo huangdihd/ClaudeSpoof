@@ -3,4 +3,14 @@
     <string-array name="xposed_scope">
         <item>com.anthropic.claude</item>
     </string-array>
+
+    <!-- 运营商预设：标签|国家ISO|运营商名|MCC/MNC|carrierId（AOSP carrier_list，-1=未知） -->
+    <string-array name="carrier_presets">
+        <item>自定义</item>
+        <item>Verizon（美国）</item>
+        <item>T-Mobile（美国）</item>
+        <item>AT&amp;T（美国）</item>
+        <item>NTT DoCoMo（日本）</item>
+        <item>SoftBank（日本）</item>
+    </string-array>
 </resources>
