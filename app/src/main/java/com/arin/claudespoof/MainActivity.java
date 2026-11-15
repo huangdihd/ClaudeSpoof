@@ -28,6 +28,10 @@ public class MainActivity extends AppCompatActivity {
             {"US", "AT&T", "310410", "1187"},
             {"JP", "docomo", "44010", "-1"},
             {"JP", "SoftBank", "44020", "-1"},
+            {"GB", "EE", "23430", "2"},
+            {"GB", "Vodafone", "23415", "28"},
+            {"GB", "O2", "23410", "1492"},
+            {"GB", "Three Mobile", "23420", "1505"},
     };
 
     private SharedPreferences prefs;

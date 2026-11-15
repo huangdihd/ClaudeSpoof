@@ -12,5 +12,9 @@
         <item>AT&amp;T（美国）</item>
         <item>NTT DoCoMo（日本）</item>
         <item>SoftBank（日本）</item>
+        <item>EE（英国）</item>
+        <item>Vodafone（英国）</item>
+        <item>O2（英国）</item>
+        <item>Three（英国）</item>
     </string-array>
 </resources>
