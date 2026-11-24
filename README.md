@@ -2,130 +2,82 @@
   <img src="art/logo.png" width="160" alt="ClaudeSpoof logo" />
 </p>
 
-# ClaudeSpoof — Claude 安卓端时区 / 语言伪装模块
+# ClaudeSpoof
 
-基于 Claude **1.261104.19**（versionCode 26110419）逆向分析编写的 LSPosed 模块，
-让 Claude 进程内所有"读系统时区 / 语言"的调用返回你设定的值。
-**v1.1 起带设置界面，时区 / 语言 / 开关在模块 App 里直接改，保存后约 5 秒生效。**
-**v1.4 起设置界面改用 Material 3（Material You，Android 12+ 动态取色）。**
+面向 Claude **Android、macOS、Windows** 三个客户端的时区／语言环境自定义工具。三种实现彼此独立，可按平台单独使用。
 
-## 使用
+默认桌面配置为 `Europe/London`／`en-GB`，也可改成其他合法 IANA 时区与 BCP-47 语言标签。
 
-1. 编译安装本模块（构建方法见下文），桌面会出现 **ClaudeSpoof** 图标。
-2. 在 LSPosed 中启用模块，**作用域只勾选 Claude**（manifest 已声明 scope）。
-3. 对 Claude **强行停止**后重新打开（首次加载模块必须重启进程）。
-4. 打开 ClaudeSpoof，设置：
-   - **时区**：IANA 时区 ID，如 `America/New_York`（建议与代理出口一致）
-   - **语言**：BCP-47 标签，如 `en-US`
-   - **运营商**：预设一键填充（Verizon / T-Mobile / AT&T / DoCoMo / SoftBank），
-     国家码、运营商名、MCC/MNC 均可自定义（v1.5 起）
-   - **启用伪装**：总开关，关闭后 Claude 读到真实系统值
-5. 保存后约 5 秒内自动生效，一般无需重启 Claude；未生效就强杀重开。
+## 客户端与实现
 
-## 验证
+| 平台 | 当前版本 | 实现方式 | 官方客户端文件 | 详细说明 |
+| --- | --- | --- | --- | --- |
+| Android | 1.5.1 | LSPosed hook Android 系统时区、locale 与运营商 API | 不修改 | [android/README.md](android/README.md) |
+| macOS | 1.1.5 | ASAR 主入口注入、完整性修复、ad-hoc 重签、更新看门狗 | 修改并备份，可还原 | [macos/README.md](macos/README.md) |
+| Windows | 1.0.0 | 官方进程内存启用临时调试入口，运行时注入并校验 | 不修改 | [windows/README.md](windows/README.md) |
 
-- LSPosed 日志出现：`ClaudeSpoof: active in process ... tz=... lang=...`
-- 抓包对比发消息请求体：`sender_timezone` 应变成设定的时区。
-- 模块只对 Claude 进程生效，不影响系统和其他 App。
+## 快速开始
 
-## Claude 更新后还能用吗？
+### Android
 
-**大概率能，无需跟进版本。** 模块 hook 的全部是 Android **系统 API**
-（`java.util.TimeZone`、`java.time.ZoneId`、`Locale`、`LocaleList`、
-`Configuration`、`android.icu`、`SystemProperties`），**不依赖 Claude 的
-混淆类名、内部类结构或网络字段名**。只要 Claude 还通过标准 API 读时区/语言，
-换版本、换混淆名、改 `sender_timezone` 字段名都不影响本模块。
+1. 安装 APK，在 LSPosed 中启用模块，作用域只选择 Claude。
+2. 强行停止并重新打开 Claude。
+3. 在 ClaudeSpoof 设置界面配置时区、语言和运营商。
 
-可能失效的情形（届时需要升级模块思路）：
+Android 端还覆盖 Claude 会读取的运营商／SIM 元数据，内置英美日运营商预设。详见 [Android 文档](android/README.md)。
 
-- 官方改为 **native 层**直接读取（C/C++ 调 ICU/libc，Java hook 够不到）；
-- 官方改为**服务器侧**根据 IP 等推断时区，不再信任本地上报；
-- 官方加入 Xposed/hook 检测并拒绝运行。
+### macOS
 
-验证方法不变：更新后看 LSPosed 日志是否有 `active` 行，抓包看 `sender_timezone`。
+需要 macOS 13+、Node.js 18+。完全退出 Claude 后，在 `macos` 目录运行：
 
-## 逆向结论（v1.0 分析依据）
+```sh
+zsh 安装自动补丁.command
+```
 
-| 用途 | 代码位置（混淆名） | 实际调用 |
-| --- | --- | --- |
-| 时区 ID（getCurrentTimezoneId） | `defpackage.ts0.g()` | `java.util.TimeZone.getDefault().getID()` |
-| 时区偏移（分钟） | `defpackage.ts0.c()` | `TimeZone.getDefault().getOffset(now)` |
-| kotlinx 时区对象 | `defpackage.neg` 接口默认方法 | `java.time.ZoneId.systemDefault()` |
-| 语言 | `ClaudeApplication`、各 Service 等 | `Locale.getDefault()` / `LocaleList.getDefault()` |
+首次运行会通过 `npm ci` 安装锁定依赖。安装后可以使用 `接管 Claude 图标.command`，让原图标先检查补丁再启动。
 
-上报字段：
+> macOS 会修改并重签 App。请阅读文档中的 Keychain、TCC、hardened runtime 和升级注意事项，并先备份完整 Claude.app。
 
-- 聊天发送请求 `com.anthropic.claude.sessions.types.SendChannelMessageRequest` → **`sender_timezone`**
-- 语音会话 `com.anthropic.voice.internal.conversation.fb` → `timezone`
-- Segment 分析埋点（`defpackage.gs0`）→ `time_zone`、`device_locale`
-- HTTP 请求头 `Accept-Language`（由 Locale 派生）
+### Windows
 
-大量 `ZoneId.systemDefault()` 调用点是 kotlinx-datetime 的
-`TimeZone.currentSystemDefault()` 被 R8 内联的结果，不存在统一业务入口，
-所以模块选择 hook 系统 API——一次覆盖全部路径，也天然抗版本更新。
+需要 Windows 10／11、官方 MSIX 版 Claude、Node.js 22+。完全退出 Claude 后，编辑 `windows/config.json`，再运行：
 
-## 配置传递实现
+```bat
+Start-ClaudeUK.cmd
+```
 
-设置界面写 `SharedPreferences("config")`，Claude 进程内通过
-`XSharedPreferences` 读取（LSPosed 支持跨进程读取）。每次被 hook 调用前
-检查缓存，超过 3 秒才 `reload()`，开销可忽略；读取失败沿用上一次值，
-从未保存过则用 `SpoofConfig` 里的兜底默认值。
+Windows 版只在本次启动的新进程内工作，不写回官方 EXE／ASAR。启动后会检查主进程、Renderer、共享 provider、Cowork 服务身份和官方文件哈希；失败会关闭本次进程，不静默退回真实时区。
 
-v1.2 起读取改为**双通道**：`XSharedPreferences` 与 `ContentProvider`
-（`content://com.arin.claudespoof.config/config`）互备，任一通道成功即采用。
+## 发布附件
 
-## 运营商 / SIM 伪装（v1.5 起）
+三客户端汇总 Release 提供：
 
-依据对 Claude **1.261109.19** 的静态分析（第三方 AI 逆向结论，SHA-256
-`e4003806…d63510b`），Claude 会读取并上传以下运营商元数据，本模块对应 hook
-`TelephonyManager` 的读取接口：
+- `ClaudeSpoof-v1.5.1.apk`：Android 安装包。
+- `ClaudeSpoof-macOS-v1.1.5.zip`：macOS 源码、安装脚本、配置与文档。
+- `ClaudeSpoof-Windows-v1.0.0.zip`：Windows 启动器、完整源码、配置与文档。
+- `SHA256SUMS.txt`：桌面压缩包及 Android APK 的 SHA-256。
 
-| Claude 内用途 | 接口 | 模块伪装值 |
-| --- | --- | --- |
-| Sift 风控 `mobile_iso_country_code` | `getSimCountryIso()` | 国家码（如 US） |
-| Sift 风控 `mobile_carrier_name` | `getNetworkOperatorName()`、`getSimOperatorName()` | 运营商名 |
-| Google CCT 日志 `mcc_mnc` | `getSimOperator()` | MCC/MNC |
-| Plaid 组件 `mcc`/`mnc` | `getNetworkOperator()` | MCC/MNC |
-| 网络监测对象 | `getSimCarrierId()`、`getSimCarrierIdName()`（API 29+） | carrierId / 运营商名 |
-| 新账户 `network_country` | `getNetworkCountryIso()` | 国家码 |
+源码仓库不保存 Claude 官方安装包、ASAR、账号数据、Cookie、token、MCP 密钥或本机验证日志。
 
-预设的 carrierId 取自 AOSP `carrier_list`（Verizon=1839、T-Mobile=1、
-AT&T=1187）；「自定义」预设返回 `-1`（unknown），与未收录运营商的真实行为一致。
+## 目录
 
-该 APK 未申请 `READ_PHONE_STATE` / `READ_PHONE_NUMBERS` / `READ_SMS`，
-也无 `getSubscriberId`（IMSI）、`getSimSerialNumber`（ICCID）、`getLine1Number`
-（手机号）、`getImei` 等调用，因此本模块同样不触碰这些高敏感标识——
-双方信息对等，才是完整的伪装。
+```text
+android/    Android LSPosed 模块与设置 App
+macos/      macOS 自动补丁器、更新看门狗与原图标启动器
+windows/    Windows 内存启动器、运行时覆盖与 VM 进程时区覆盖
+art/        共享图标资源
+LICENSE     GPL-3.0-or-later
+```
 
-## 构建
+## 验证与兼容边界
 
-1. Android Studio **Open** 打开本目录，同步后 **Build → Build APK(s)**。
-2. 或命令行（Gradle 8.x + Android SDK 34）：
-   ```bash
-   gradle :app:assembleRelease
-   ```
-   产物在 `app/build/outputs/apk/release/app-release.apk`。
-3. 若 `de.robv.android.xposed:api:82` 拉取失败（api.xposed.info 国内不稳定），
-   手动下载 XposedBridgeApi.jar 放入 `app/libs/`，把 `app/build.gradle`
-   里的依赖改为 `compileOnly files('libs/XposedBridgeApi.jar')`。
-
-## 版本历史
-
-- **v1.5.0**：运营商 / SIM 元数据伪装（TelephonyManager 八个接口），运营商预设下拉（Verizon / T-Mobile / AT&T / DoCoMo / SoftBank），依据 1.261109.19 静态分析覆盖 Sift / Plaid / CCT / ReportDeviceFacts 数据源。
-- **v1.4.1**：新 LOGO——戴上假鼻子胡子墨镜的橙色太阳花（自适应图标，Android 12+ 随主题取色）。
-- **v1.4**：设置界面 Material 3 重设计（AppBar + 卡片 + 描边输入框 + MaterialSwitch，Android 12+ 动态取色）。
-- **v1.3**：配置读取双通道、per-app 语言 API 补全。
-- **v1.1**：加入设置界面。
-- **v1.0**：首版，hook 系统时区 / 语言 API。
-
-## 限制与提醒
-
-- 针对 1.261104.19 分析；兼容性判断见上文"Claude 更新后还能用吗"。
-- **时区/语言只是风控信号之一**：出口 IP、账号注册资料、手机号归属地、
-  支付信息等都可能参与判定，本模块不等于"隐身"。
-- `LANGUAGE_TAG` 会影响 Claude 界面语言与 Accept-Language。
-- 绕过应用的区域限制可能违反 Anthropic 用户协议，账号风险自担。
+- Android 主要 hook 系统 API，通常不依赖 Claude 混淆类名。
+- macOS 会动态识别 ASAR 主入口，但签名、Keychain、权限和未来 Squirrel 更新仍受系统与新版影响。
+- Windows 当前针对 Claude 6.28899.6.0 验证；共享模块或 VM 导出变化会触发失败保护，需要更新适配。
+- Windows VM 覆盖针对由 Claude VM client 创建的进程；不会修改 VM 的 `/etc/localtime`、`/etc/timezone` 或独立系统服务。
+- 时区、语言、运营商只是环境信号的一部分；出口 IP、账号资料、支付信息等仍可能独立存在。
+- 本工具不等于隐身、隐私保护或网络请求阻断器。绕过区域限制可能违反服务条款，使用与账号风险由用户自行承担。
 
 ## 许可证
 
-GPL-3.0-or-later，见 [LICENSE](LICENSE)。
+整个仓库采用 **GPL-3.0-or-later**，见 [LICENSE](LICENSE)。

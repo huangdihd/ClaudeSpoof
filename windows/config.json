@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "timezone": "Europe/London",
+  "language": "en-GB",
+  "overrideAcceptLanguage": true,
+  "verifyCoworkVm": false,
+  "configureCoworkVm": false,
+  "restartCoworkVm": false
+}
