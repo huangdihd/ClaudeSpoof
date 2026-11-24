@@ -8,7 +8,6 @@ const DEFAULTS = Object.freeze({
   enabled: true,
   timezone: 'Europe/London',
   language: 'en-GB',
-  overrideAcceptLanguage: true,
 });
 
 function stateHome() {
@@ -54,7 +53,10 @@ function validateLanguage(language) {
 }
 
 function loadConfig() {
-  return Object.assign({}, DEFAULTS, readJson(configPath(), {}));
+  const saved = readJson(configPath(), {});
+  const config = Object.assign({}, DEFAULTS, saved);
+  delete config.overrideAcceptLanguage; // 1.x 遗留字段；2.x 由 --lang 统一处理
+  return config;
 }
 
 function updateConfig(patch) {
@@ -69,9 +71,6 @@ function updateConfig(patch) {
     next.language = patch.language;
   }
   if (patch.enabled !== undefined) next.enabled = Boolean(patch.enabled);
-  if (patch.overrideAcceptLanguage !== undefined) {
-    next.overrideAcceptLanguage = Boolean(patch.overrideAcceptLanguage);
-  }
   writeJson(configPath(), next);
   return next;
 }

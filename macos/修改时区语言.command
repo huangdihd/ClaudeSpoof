@@ -9,4 +9,4 @@ printf "语言 [en-GB]："
 read LANGUAGE
 LANGUAGE="${LANGUAGE:-en-GB}"
 node "$DIR/src/cli.js" config --timezone "$TIMEZONE" --language "$LANGUAGE"
-echo "请完全退出并重新打开 Claude。"
+echo "请完全退出 Claude，再用“启动 Claude.command”重新打开。"
