@@ -80,6 +80,15 @@ function Wait-JsonFile([string]$path, [int]$timeoutSeconds) {
     throw "Timed out waiting for verification file: $path"
 }
 
+function Start-UpdateWatcher {
+    $watcher = Join-Path $runtime 'Watch-ClaudeUK.ps1'
+    if (-not (Test-Path -LiteralPath $watcher)) { return }
+    # The watcher has a per-user/per-directory mutex, so repeated launches are safe.
+    Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $watcher)
+    ) | Out-Null
+}
+
 $official = Get-OfficialClaudePath
 $config = Read-JsonFile (Join-Path $runtime 'config.json')
 if ($null -eq $config -or -not $config.enabled) { throw 'config.json is missing, invalid, or disabled.' }
@@ -128,6 +137,7 @@ if ($existing.Count -ne 0) {
             activatedAtUtc = [DateTime]::UtcNow.ToString('o')
         }
         [IO.File]::WriteAllText((Join-Path $runtime 'last-invocation.json'), ($state | ConvertTo-Json -Depth 4))
+        Start-UpdateWatcher
         $state | ConvertTo-Json -Depth 4
         exit 0
     }
@@ -229,6 +239,7 @@ try {
     }
     [IO.File]::WriteAllText((Join-Path $runtime 'last-launch-verification.json'), ($state | ConvertTo-Json -Depth 4))
     [IO.File]::WriteAllText((Join-Path $runtime 'last-invocation.json'), ($state | ConvertTo-Json -Depth 4))
+    Start-UpdateWatcher
     $state | ConvertTo-Json -Depth 4
 } catch {
     if ($startedOfficial) {

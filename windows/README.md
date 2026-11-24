@@ -6,7 +6,7 @@
 
 ## 已验证版本与边界
 
-- 已验证官方 Claude **6.28899.6.0**。
+- 已验证官方 Claude **7.37095.0.0**；启动器按实现行为与源码特征动态定位共享模块，不写死 Vite chunk 哈希名或混淆导出别名。
 - 官方 `Claude.exe` 的 Authenticode 签名在运行前后保持有效，SHA-256 不变。
 - Windows 系统时区保持不变；主进程、Renderer 和共享时区 provider 使用配置值。
 - 已实测 Cowork VM 默认一次性进程、Cowork 同等环境调用、VM 停止并重启后的进程。
@@ -49,6 +49,7 @@
    - 已有官方直启、验证过期或环境不匹配的实例时，先尝试正常关闭，最多等待 10 秒；残留进程会被结束，然后重新启动并执行完整核验。
 5. 首次运行会把原开始菜单快捷方式备份为 `Claude.start-menu-original.lnk`，再把用户的 `Start Menu\Programs\Claude.lnk` 指向本启动器。以后直接点击开始菜单中的 **Claude** 即可进入配置后的环境，后台已运行时也同样适用。
 6. 完整检查成功后会留下 `last-launch-verification.json`；每次调用动作另记在 `last-invocation.json`，其中 `alreadyRunning` 表示复用已验证实例，`restartedUnverifiedInstance` 表示替换了未验证实例。日常使用不需要管理员权限，也不需要编译 C#。
+7. 成功启动后会运行单实例更新守护 `Watch-ClaudeUK.ps1`。官方客户端若因自动更新或自身重启而出现未验证实例，守护会调用同一套失败保护启动器重新注入；手动退出 Claude 不会被重新拉起。修复失败会退避 5 分钟，不会循环重启。状态见 `watcher-status.json`，动作输出见 `watcher-launch.log`。
 
 如需桌面入口，可让快捷方式指向解压目录中的 `Start-ClaudeUK.cmd`。移动目录后，需要通过新目录运行一次启动器，以修复开始菜单目标。
 
@@ -56,7 +57,8 @@
 
 - `MemoryFuseLauncher.exe`：已测试的 x64 Windows 启动器。
 - `MemoryFuseLauncher.cs`：上述启动器的完整源码。
-- `Start-ClaudeUK.ps1`：官方版本发现、签名／哈希检查、运行时校验与失败清理。
+- `Start-ClaudeUK.ps1`：官方版本发现、签名／哈希检查、运行时校验、失败清理与更新守护启动。
+- `Watch-ClaudeUK.ps1`：单实例官方更新／直启检测，未验证实例修复与失败退避。
 - `Install-ClaudeUKShortcut.ps1`：备份并接管当前用户的开始菜单 `Claude.lnk`。
 - `Restore-ClaudeUKShortcut.ps1`／`Restore-ClaudeUK.cmd`：恢复原开始菜单快捷方式。
 - `inspect_client.js`：连接临时的回环调试器，在官方 launcher 调用帧中执行注入。
@@ -79,9 +81,9 @@ VM watcher 每约 5 秒检查一次连接状态，只在发现 VM 已连接后�
 
 ## 官方更新
 
-脚本会动态寻找最新 MSIX 安装目录，但当前共享模块名和 VM 导出别名仍属于版本相关实现。更新后如果模块缺失或不匹配，启动器会报错并结束本次进程；这属于预期的失败保护，不是自动兼容所有未来版本。
+脚本动态寻找最新 MSIX 安装目录，并按函数行为与源码特征定位 provider 和 Cowork API；懒加载模块会先从官方 ASAR 中定位再加载。Vite 哈希文件名和混淆导出别名变化本身不会导致失效，但官方若改变这些行为特征，仍会报错并结束本次进程。这是预期的失败保护，不代表自动兼容所有未来版本。
 
-不要用旧验证文件判断新版本是否安全。更新后应重新进行一次完整启动检查。
+已验证实例的 PID、package 路径和运行时结果必须匹配；不会用旧验证文件判断新版本是否安全。官方自动更新产生未验证实例时，更新守护会重新执行完整启动检查；不兼容时退避并保留错误日志。
 
 ## 卸载
 

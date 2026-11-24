@@ -3,6 +3,15 @@ $runtime = $PSScriptRoot
 $shortcutPath = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Claude.lnk'
 $backupPath = Join-Path $runtime 'Claude.start-menu-original.lnk'
 $target = Join-Path $runtime 'Start-ClaudeUK.cmd'
+$watcherPath = Join-Path $runtime 'Watch-ClaudeUK.ps1'
+
+# Restoring the official entry also stops update repair, otherwise the watcher
+# would correctly put the managed environment back on the next official launch.
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
+    $_.CommandLine -and $_.CommandLine.IndexOf($watcherPath, [StringComparison]::OrdinalIgnoreCase) -ge 0
+} | ForEach-Object {
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+}
 
 if (Test-Path -LiteralPath $backupPath) {
     Copy-Item -LiteralPath $backupPath -Destination $shortcutPath -Force

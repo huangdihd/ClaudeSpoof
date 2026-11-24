@@ -85,6 +85,105 @@ const claudeSpoofConfigPath = process.env.CLAUDE_SPOOF_CONFIG || require('node:p
       sampleLocalTime: date.toString(),
     };
   }
+
+  // Discover implementation modules by behavior, never by Vite hash names or
+  // minified export aliases. Those names change on ordinary official updates.
+  function findUniqueBuildModule(predicate, description) {
+    const matches = [];
+    for (const name of fs.readdirSync(__dirname)) {
+      if (!name.endsWith('.js')) continue;
+      const filename = path.join(__dirname, name);
+      let source = '';
+      try { source = fs.readFileSync(filename, 'utf8'); } catch (_) { continue; }
+      if (predicate(source, null, filename)) matches.push(filename);
+    }
+    if (matches.length !== 1) {
+      throw new Error(`${description}: expected one source module, found ${matches.length}`);
+    }
+    return matches[0];
+  }
+  function findUniqueExport(predicate, description, scanDisk = true, modulePredicate = predicate) {
+    const matches = [];
+    for (const [filename, module] of Object.entries(require.cache)) {
+      if (!filename.includes(`${path.sep}.vite${path.sep}build${path.sep}`)) continue;
+      for (const [exportName, value] of Object.entries(module.exports || {})) {
+        if (typeof value !== 'function') continue;
+        let source = '';
+        try { source = Function.prototype.toString.call(value); } catch (_) { continue; }
+        if (predicate(source, exportName, filename)) {
+          matches.push({ fn: value, module: filename, exportName });
+        }
+      }
+    }
+    const unique = [...new Map(matches.map((row) => [row.fn, row])).values()];
+    if (unique.length === 0 && scanDisk) {
+      // Some shared providers are lazy-loaded after app.ready. Locate the one
+      // matching implementation inside the official ASAR and load it ourselves.
+      require(findUniqueBuildModule(modulePredicate, description));
+      return findUniqueExport(predicate, description, false, modulePredicate);
+    }
+    if (unique.length !== 1) {
+      throw new Error(`${description}: expected one behavioral match, found ${unique.length}`);
+    }
+    return unique[0];
+  }
+  function timezoneProvider() {
+    return findUniqueExport((source) =>
+      source.includes('Etc/Unknown') && (
+        (source.includes('resolvedOptions') && source.includes('timeZone')) ||
+        source.includes('TimeZoneKeyName')
+      ),
+    'shared timezone provider', true, (source) =>
+      source.includes('resolvedOptions') && source.includes('TimeZoneKeyName'));
+  }
+  function coworkApi() {
+    return {
+      oneShot: findUniqueExport((source) =>
+        source.includes('VM is not available.') && source.includes('VM guest is not connected.'),
+      'Cowork one-shot execution'),
+      start: findUniqueExport((source) => source.includes('[startVM] VM startup already in progress'),
+        'Cowork VM start'),
+    };
+  }
+  function describeApi(api) {
+    return Object.fromEntries(Object.entries(api).map(([name, row]) => [name, {
+      module: path.basename(row.module), exportName: row.exportName,
+    }]));
+  }
+  function vmServiceCall(method) {
+    return new Promise((resolve, reject) => {
+      const socket = net.createConnection('\\\\.\\pipe\\cowork-vm-service');
+      let buffer = Buffer.alloc(0);
+      let settled = false;
+      const timer = setTimeout(() => finish(new Error(`Timeout: ${method}`)), 10000);
+      function finish(error, result) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        socket.destroy();
+        if (error) reject(error); else resolve(result);
+      }
+      socket.on('connect', () => {
+        const body = Buffer.from(JSON.stringify({ method }), 'utf8');
+        const header = Buffer.alloc(4);
+        header.writeUInt32BE(body.length, 0);
+        socket.write(Buffer.concat([header, body]));
+      });
+      socket.on('data', (chunk) => {
+        buffer = Buffer.concat([buffer, chunk]);
+        if (buffer.length < 4) return;
+        const length = buffer.readUInt32BE(0);
+        if (buffer.length < length + 4) return;
+        try {
+          const response = JSON.parse(buffer.subarray(4, 4 + length).toString('utf8'));
+          if (response.success) finish(null, response.result);
+          else finish(new Error(response.error || 'Request failed'));
+        } catch (error) { finish(error); }
+      });
+      socket.on('error', (error) => finish(error));
+      socket.on('end', () => { if (!settled) finish(new Error(`Connection ended: ${method}`)); });
+    });
+  }
   try {
     verification.main = { processId: process.pid, envTZ: process.env.TZ, ...dateSample() };
     saveVerification();
@@ -122,15 +221,16 @@ const claudeSpoofConfigPath = process.env.CLAUDE_SPOOF_CONFIG || require('node:p
         electronLocale: app.getLocale(),
         preferredSystemLanguages: app.getPreferredSystemLanguages(),
       };
-      // Latest Code, Cowork and Computer Use all import this exact provider.
-      const provider = require('./index.chunk-DCLV6e70.js');
+      // Code, Cowork and Computer Use share this provider. Resolve it from
+      // loaded exports by behavior so hashed chunk names can change freely.
+      const provider = timezoneProvider();
       verification.sharedTimezoneProvider = {
-        module: 'index.chunk-DCLV6e70.js',
+        module: path.basename(provider.module),
+        exportName: provider.exportName,
         consumers: ['Code', 'Cowork', 'Computer Use'],
-        resolvedTimeZone: provider.t(),
+        resolvedTimeZone: provider.fn(),
       };
-      const core = require('./index.chunk-CCkEi--u.js');
-      verification.vmApiExports = Object.keys(core).filter((key) => /vm|cowork/i.test(key)).sort();
+      verification.coworkApi = describeApi(coworkApi());
     } catch (error) {
       verification.errors.push({ scope: 'electron', message: String(error && error.message || error) });
     }
@@ -156,11 +256,8 @@ const claudeSpoofConfigPath = process.env.CLAUDE_SPOOF_CONFIG || require('node:p
       const save = () => fs.writeFileSync(outputPath, JSON.stringify(result, null, 2));
       save();
       try {
-        const core = require('./index.chunk-CCkEi--u.js');
-        if (typeof core.nA !== 'function' || typeof core.dA !== 'function') {
-          throw new Error('This Claude build does not expose the verified VM start/one-shot aliases.');
-        }
-        const runDefault = (processName) => core.dA({
+        const api = coworkApi();
+        const runDefault = (processName) => api.oneShot.fn({
           processName,
           command: '/bin/sh',
           args: ['-c', 'printf "TZ=%s\\n" "${TZ-<unset>}"; date "+DATE=%Y-%m-%d %H:%M:%S %Z %z"; if [ -r /etc/timezone ]; then printf "ETC_TIMEZONE="; tr -d "\\r\\n" </etc/timezone; printf "\\n"; fi'],
@@ -170,11 +267,11 @@ const claudeSpoofConfigPath = process.env.CLAUDE_SPOOF_CONFIG || require('node:p
           oneShot: true,
         }, 30000);
         result.bundleExistedBefore = fs.existsSync(path.join(app.getPath('userData'), 'vm_bundles', 'claudevm.bundle'));
-        await core.nA(void 0, void 0, { autoReinstall: false, caller: 'timezone_verification' });
+        await api.start.fn(void 0, void 0, { autoReinstall: false, caller: 'timezone_verification' });
         result.startReturned = true;
         save();
         if (config.configureCoworkVm) {
-          result.configureExecution = await core.dA({
+          result.configureExecution = await api.oneShot.fn({
             processName: 'tz-config',
             command: '/bin/sh',
             args: ['-c', 'set -eu; id; test -e /usr/share/zoneinfo/Europe/London; sudo -n ln -sf /usr/share/zoneinfo/Europe/London /etc/localtime; printf "Europe/London\\n" | sudo -n tee /etc/timezone >/dev/null; sync; printf "CONFIGURED="; readlink /etc/localtime; date "+DATE=%Y-%m-%d %H:%M:%S %Z %z"'],
@@ -189,29 +286,26 @@ const claudeSpoofConfigPath = process.env.CLAUDE_SPOOF_CONFIG || require('node:p
         save();
         // This is the exact environment override used by Cowork's Claude Code
         // launcher and VM Bash tool: { TZ: sharedTimezoneProvider.t() }.
-        const provider = require('./index.chunk-DCLV6e70.js');
-        result.clientEquivalentExecution = await core.dA({
+        const provider = timezoneProvider();
+        result.clientEquivalentExecution = await api.oneShot.fn({
           processName: 'tz-cowork-env',
           command: '/bin/sh',
           args: ['-c', 'printf "TZ=%s\\n" "${TZ-<unset>}"; date "+DATE=%Y-%m-%d %H:%M:%S %Z %z"'],
           cwd: '/',
-          env: { TZ: provider.t() },
+          env: { TZ: provider.fn() },
           additionalMounts: {},
           isResume: false,
           oneShot: true,
         }, 30000);
         save();
         if (config.restartCoworkVm) {
-          if (typeof core.rA !== 'function' || typeof core.cA !== 'function') {
-            throw new Error('This Claude build does not expose the verified VM stop/status aliases.');
-          }
-          await core.rA(1);
+          await vmServiceCall('stopVM');
           const deadline = Date.now() + 30000;
-          while (await core.cA()) {
+          while ((await vmServiceCall('isGuestConnected')).connected === true) {
             if (Date.now() > deadline) throw new Error('VM remained connected after the requested restart.');
             await new Promise((resolve) => setTimeout(resolve, 500));
           }
-          await core.nA(void 0, void 0, { autoReinstall: false, caller: 'timezone_restart_verification' });
+          await api.start.fn(void 0, void 0, { autoReinstall: false, caller: 'timezone_restart_verification' });
           result.postRestartExecution = await runDefault('tz-after-restart');
         }
         result.completed = true;
@@ -231,9 +325,9 @@ const claudeSpoofConfigPath = process.env.CLAUDE_SPOOF_CONFIG || require('node:p
   // command deliberately omits env, so a London result proves the spawn hook
   // covered a process that the client would otherwise leave as UTC.
   app.whenReady().then(() => {
-    const core = require('./index.chunk-CCkEi--u.js');
-    if (typeof core.cA !== 'function' || typeof core.dA !== 'function') return;
     const outputPath = path.join(path.dirname(configPath), 'vm-auto-verification.json');
+    let oneShot;
+    try { oneShot = coworkApi().oneShot; } catch (_) { return; }
     let wasConnected = false;
     let verifiedThisConnection = false;
     let running = false;
@@ -243,7 +337,7 @@ const claudeSpoofConfigPath = process.env.CLAUDE_SPOOF_CONFIG || require('node:p
       if (running) return;
       let connected = false;
       try {
-        const status = await core.cA();
+        const status = await vmServiceCall('isGuestConnected');
         connected = status === true || Boolean(status && status.connected === true);
       } catch (_) {
         connected = false;
@@ -269,7 +363,7 @@ const claudeSpoofConfigPath = process.env.CLAUDE_SPOOF_CONFIG || require('node:p
         note: 'Runtime process environment only; VM system files were not modified.',
       };
       try {
-        const execution = await core.dA({
+        const execution = await oneShot.fn({
           processName: 'tz-auto',
           command: '/bin/sh',
           args: ['-c', 'printf "TZ=%s\\n" "${TZ-<unset>}"; date "+DATE=%Y-%m-%d %H:%M:%S %Z %z"; if [ -r /etc/timezone ]; then printf "ETC_TIMEZONE="; tr -d "\\r\\n" </etc/timezone; printf "\\n"; fi'],

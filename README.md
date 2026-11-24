@@ -14,7 +14,7 @@
 | --- | --- | --- | --- | --- |
 | Android | 1.5.1 | LSPosed hook Android 系统时区、locale 与运营商 API | 不修改 | [android/README.md](android/README.md) |
 | macOS | 2.0.0 | 同名外壳接管原入口，LaunchServices `open --env` 传 `TZ` 与 Chromium `--lang` | 不修改 | [macos/README.md](macos/README.md) |
-| Windows | 1.0.2 | 官方进程内存启用临时调试入口，运行时注入并校验 | 不修改 | [windows/README.md](windows/README.md) |
+| Windows | 1.1.0 | 官方进程内存启用临时调试入口，行为特征动态注入、校验与更新守护 | 不修改 | [windows/README.md](windows/README.md) |
 
 ## 快速开始
 
@@ -46,7 +46,7 @@ node src/cli.js install-wrapper
 Start-ClaudeUK.cmd
 ```
 
-Windows 版只在本次启动的新进程内工作，不写回官方 EXE／ASAR。首次运行会备份并接管当前用户开始菜单中的 `Claude.lnk`，以后可继续从开始菜单的 Claude 图标进入。已验证的英国后台实例会直接唤醒；官方直启或验证不匹配的实例会先退出，再以配置环境重启并完整检查主进程、Renderer、共享 provider、Cowork 服务身份和官方文件哈希。失败会关闭本次进程，不静默退回真实时区。
+Windows 版只在本次启动的新进程内工作，不写回官方 EXE／ASAR。首次运行会备份并接管当前用户开始菜单中的 `Claude.lnk`，以后可继续从开始菜单的 Claude 图标进入。共享模块按行为和源码特征动态定位，不依赖 chunk 哈希名。已验证的英国后台实例会直接唤醒；官方直启或验证不匹配的实例会先退出，再以配置环境重启并完整检查主进程、Renderer、共享 provider、Cowork 服务身份和官方文件哈希。更新守护会处理官方自动更新后的未验证实例，失败会关闭本次进程或退避，不静默退回真实时区。
 
 ## 发布附件
 
@@ -54,7 +54,7 @@ Windows 版只在本次启动的新进程内工作，不写回官方 EXE／ASAR�
 
 - `ClaudeSpoof-v1.5.1.apk`：Android 安装包。
 - `ClaudeSpoof-macOS-v2.0.0.zip`：macOS 官方签名环境启动器、配置与文档。
-- `ClaudeSpoof-Windows-v1.0.2.zip`：Windows 启动器、完整源码、配置与文档。
+- `ClaudeSpoof-Windows-v1.1.0.zip`：Windows 启动器、完整源码、配置与文档。
 - `SHA256SUMS.txt`：桌面压缩包及 Android APK 的 SHA-256。
 
 源码仓库不保存 Claude 官方安装包、ASAR、账号数据、Cookie、token、MCP 密钥或本机验证日志。
@@ -73,7 +73,7 @@ LICENSE     GPL-3.0-or-later
 
 - Android 主要 hook 系统 API，通常不依赖 Claude 混淆类名。
 - macOS 已在 Electron 45.3.3 上验证 Renderer 继承 `TZ` 与 `--lang`；真实客户端的设备密钥、会话关联和附加文件夹也已实测。接管后从原入口启动即继承环境；直接打开隐藏目录里的官方 App 不会继承。
-- Windows 当前针对 Claude 6.28899.6.0 验证；共享模块或 VM 导出变化会触发失败保护，需要更新适配。
+- Windows 当前针对 Claude 7.37095.0.0 验证；共享模块按行为特征定位，行为实现变化会触发失败保护，需要更新适配。
 - Windows VM 覆盖针对由 Claude VM client 创建的进程；不会修改 VM 的 `/etc/localtime`、`/etc/timezone` 或独立系统服务。
 - 时区、语言、运营商只是环境信号的一部分；出口 IP、账号资料、支付信息等仍可能独立存在。
 - 本工具不等于隐身、隐私保护或网络请求阻断器。绕过区域限制可能违反服务条款，使用与账号风险由用户自行承担。
