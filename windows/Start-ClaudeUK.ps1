@@ -45,6 +45,10 @@ $vmVerificationPath = Join-Path $runtime 'vm-service-verification.json'
 $inspectorResultPath = Join-Path $runtime 'inspector-result.json'
 Remove-Item -LiteralPath $verificationPath,$vmVerificationPath,$inspectorResultPath -Force -ErrorAction SilentlyContinue
 
+# Keep the ordinary Start Menu entry pointed at this fail-closed launcher.
+# The original shortcut is backed up once inside the runtime directory.
+& (Join-Path $runtime 'Install-ClaudeUKShortcut.ps1') | Out-Null
+
 try {
     $launchOutput = (& (Join-Path $runtime 'MemoryFuseLauncher.exe') $official $port | Out-String).Trim()
     if ($LASTEXITCODE -ne 0) { throw "MemoryFuseLauncher failed: $launchOutput" }

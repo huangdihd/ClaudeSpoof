@@ -14,7 +14,7 @@
 | --- | --- | --- | --- | --- |
 | Android | 1.5.1 | LSPosed hook Android 系统时区、locale 与运营商 API | 不修改 | [android/README.md](android/README.md) |
 | macOS | 1.1.5 | ASAR 主入口注入、完整性修复、ad-hoc 重签、更新看门狗 | 修改并备份，可还原 | [macos/README.md](macos/README.md) |
-| Windows | 1.0.0 | 官方进程内存启用临时调试入口，运行时注入并校验 | 不修改 | [windows/README.md](windows/README.md) |
+| Windows | 1.0.1 | 官方进程内存启用临时调试入口，运行时注入并校验 | 不修改 | [windows/README.md](windows/README.md) |
 
 ## 快速开始
 
@@ -46,7 +46,7 @@ zsh 安装自动补丁.command
 Start-ClaudeUK.cmd
 ```
 
-Windows 版只在本次启动的新进程内工作，不写回官方 EXE／ASAR。启动后会检查主进程、Renderer、共享 provider、Cowork 服务身份和官方文件哈希；失败会关闭本次进程，不静默退回真实时区。
+Windows 版只在本次启动的新进程内工作，不写回官方 EXE／ASAR。首次运行会备份并接管当前用户开始菜单中的 `Claude.lnk`，以后可继续从开始菜单的 Claude 图标进入。启动后会检查主进程、Renderer、共享 provider、Cowork 服务身份和官方文件哈希；失败会关闭本次进程，不静默退回真实时区。
 
 ## 发布附件
 
@@ -54,7 +54,7 @@ Windows 版只在本次启动的新进程内工作，不写回官方 EXE／ASAR�
 
 - `ClaudeSpoof-v1.5.1.apk`：Android 安装包。
 - `ClaudeSpoof-macOS-v1.1.5.zip`：macOS 源码、安装脚本、配置与文档。
-- `ClaudeSpoof-Windows-v1.0.0.zip`：Windows 启动器、完整源码、配置与文档。
+- `ClaudeSpoof-Windows-v1.0.1.zip`：Windows 启动器、完整源码、配置与文档。
 - `SHA256SUMS.txt`：桌面压缩包及 Android APK 的 SHA-256。
 
 源码仓库不保存 Claude 官方安装包、ASAR、账号数据、Cookie、token、MCP 密钥或本机验证日志。

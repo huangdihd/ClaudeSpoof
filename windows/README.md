@@ -44,15 +44,18 @@
    ```
 
 4. 启动器会寻找最新安装的官方 MSIX 包，检查签名、启动官方进程、执行内存注入并核验结果。
-5. 检查成功后会留下 `last-launch-verification.json`。日常使用不需要管理员权限，也不需要编译 C#。
+5. 首次运行会把原开始菜单快捷方式备份为 `Claude.start-menu-original.lnk`，再把用户的 `Start Menu\Programs\Claude.lnk` 指向本启动器。以后直接点击开始菜单中的 **Claude** 即可进入配置后的环境。
+6. 检查成功后会留下 `last-launch-verification.json`。日常使用不需要管理员权限，也不需要编译 C#。
 
-如需桌面入口，可让快捷方式指向解压目录中的 `Start-ClaudeUK.cmd`。移动目录后，重新创建旧快捷方式即可。
+如需桌面入口，可让快捷方式指向解压目录中的 `Start-ClaudeUK.cmd`。移动目录后，需要通过新目录运行一次启动器，以修复开始菜单目标。
 
 ## 文件说明
 
 - `MemoryFuseLauncher.exe`：已测试的 x64 Windows 启动器。
 - `MemoryFuseLauncher.cs`：上述启动器的完整源码。
 - `Start-ClaudeUK.ps1`：官方版本发现、签名／哈希检查、运行时校验与失败清理。
+- `Install-ClaudeUKShortcut.ps1`：备份并接管当前用户的开始菜单 `Claude.lnk`。
+- `Restore-ClaudeUKShortcut.ps1`／`Restore-ClaudeUK.cmd`：恢复原开始菜单快捷方式。
 - `inspect_client.js`：连接临时的回环调试器，在官方 launcher 调用帧中执行注入。
 - `runtime-probe.js`：主进程、Renderer、共享 provider 与 VM spawn 的运行时覆盖和验证。
 - `config.json`：用户配置；三个一次性 VM 测试开关日常必须保持 `false`。
@@ -79,9 +82,9 @@ VM watcher 每约 5 秒检查一次连接状态，只在发现 VM 已连接后�
 
 ## 卸载
 
-完全退出 Claude，删除本工具目录及自行创建的快捷方式即可。官方 Claude 文件没有被本方案改写，因此不需要恢复官方 EXE 或 ASAR。
+完全退出 Claude，先运行 `Restore-ClaudeUK.cmd` 恢复原开始菜单快捷方式，再删除本工具目录及自行创建的桌面快捷方式。官方 Claude 文件没有被本方案改写，因此不需要恢复官方 EXE 或 ASAR。
 
-如需彻底恢复未注入状态，直接从官方入口重新启动 Claude；此时客户端会使用系统真实环境。
+恢复后如需彻底使用未注入状态，从恢复后的官方入口启动 Claude；此时客户端会使用系统真实环境。
 
 ## 源码重编译（可选）
 
