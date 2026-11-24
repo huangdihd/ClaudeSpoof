@@ -18,7 +18,7 @@
 1. Windows 10／11，已安装官方 MSIX 版 Claude。
 2. Node.js **22 或更新版本**，并确保 `node` 在 PATH 中。
 3. 正常运行启动器需要交互式桌面会话；不要通过普通 SSH 服务会话直接启动 GUI。
-4. 完全退出 Claude，包括托盘和后台进程。
+4. 不需要提前退出 Claude；启动器会按下述规则处理已经运行的实例。
 
 ## 使用
 
@@ -43,9 +43,12 @@
    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Start-ClaudeUK.ps1
    ```
 
-4. 启动器会寻找最新安装的官方 MSIX 包，检查签名、启动官方进程、执行内存注入并核验结果。
-5. 首次运行会把原开始菜单快捷方式备份为 `Claude.start-menu-original.lnk`，再把用户的 `Start Menu\Programs\Claude.lnk` 指向本启动器。以后直接点击开始菜单中的 **Claude** 即可进入配置后的环境。
-6. 检查成功后会留下 `last-launch-verification.json`。日常使用不需要管理员权限，也不需要编译 C#。
+4. 启动器会寻找最新安装的官方 MSIX 包并检查签名：
+   - 没有后台实例时，启动官方进程、执行内存注入并完成完整核验。
+   - 已有实例且其 PID、主进程、Renderer、共享 provider 和语言验证均与当前配置匹配时，通过官方单实例机制唤醒原窗口，不重新注入，也不覆盖完整启动验证记录。
+   - 已有官方直启、验证过期或环境不匹配的实例时，先尝试正常关闭，最多等待 10 秒；残留进程会被结束，然后重新启动并执行完整核验。
+5. 首次运行会把原开始菜单快捷方式备份为 `Claude.start-menu-original.lnk`，再把用户的 `Start Menu\Programs\Claude.lnk` 指向本启动器。以后直接点击开始菜单中的 **Claude** 即可进入配置后的环境，后台已运行时也同样适用。
+6. 完整检查成功后会留下 `last-launch-verification.json`；每次调用动作另记在 `last-invocation.json`，其中 `alreadyRunning` 表示复用已验证实例，`restartedUnverifiedInstance` 表示替换了未验证实例。日常使用不需要管理员权限，也不需要编译 C#。
 
 如需桌面入口，可让快捷方式指向解压目录中的 `Start-ClaudeUK.cmd`。移动目录后，需要通过新目录运行一次启动器，以修复开始菜单目标。
 

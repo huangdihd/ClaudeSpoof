@@ -86,7 +86,7 @@ const claudeSpoofConfigPath = process.env.CLAUDE_SPOOF_CONFIG || require('node:p
     };
   }
   try {
-    verification.main = { envTZ: process.env.TZ, ...dateSample() };
+    verification.main = { processId: process.pid, envTZ: process.env.TZ, ...dateSample() };
     saveVerification();
   } catch (error) {
     verification.errors.push({ scope: 'main', message: String(error && error.message || error) });
@@ -117,7 +117,7 @@ const claudeSpoofConfigPath = process.env.CLAUDE_SPOOF_CONFIG || require('node:p
     try {
       verification.main = {
         ...verification.main,
-        envTZ: process.env.TZ,
+        processId: process.pid, envTZ: process.env.TZ,
         ...dateSample(),
         electronLocale: app.getLocale(),
         preferredSystemLanguages: app.getPreferredSystemLanguages(),
