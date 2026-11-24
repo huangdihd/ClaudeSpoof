@@ -8,7 +8,7 @@
     "claude-spoof": "src/cli.js"
   },
   "scripts": {
-    "check": "node --check src/config.js && node --check src/environment.js && node --check src/cli.js && node test/environment.js"
+    "check": "node --check src/config.js && node --check src/environment.js && node --check src/wrapper.js && node --check src/cli.js && node test/environment.js && node test/wrapper.js"
   },
   "license": "GPL-3.0-or-later",
   "type": "commonjs",

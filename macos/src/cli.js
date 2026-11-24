@@ -16,6 +16,11 @@ const {
   verifyOfficialSignature,
   runtimeStatePath,
 } = require('./environment');
+const {
+  installWrapper,
+  removeWrapper,
+  resolveAppPath,
+} = require('./wrapper');
 
 const LEGACY_AGENT_LABEL = 'com.arin.claudespoof.watch';
 
@@ -23,11 +28,16 @@ function usage() {
   console.log(`ClaudeSpoof macOS 官方签名环境启动器
 
 用法：
+  node src/cli.js install-wrapper [--app /Applications/Claude.app]
+  node src/cli.js remove-wrapper [--app /Applications/Claude.app]
   node src/cli.js start [--app /Applications/Claude.app]
   node src/cli.js verify [--app /Applications/Claude.app]
   node src/cli.js status [--app /Applications/Claude.app]
   node src/cli.js config [--timezone Europe/London] [--language en-GB] [--enabled true|false]
   node src/cli.js uninstall-agent
+
+install-wrapper 会把官方 App 移到隐藏的 .ClaudeSpoof 目录，并在原路径保留同名、
+同图标的 Claude 启动入口；运行进程与窗口名称仍来自真正的官方 App。
 
 配置文件：${configPath()}
 `);
@@ -85,30 +95,36 @@ function main() {
     if (options.language !== undefined) patch.language = options.language;
     if (options.enabled !== undefined) patch.enabled = bool(options.enabled);
     const config = Object.keys(patch).length ? updateConfig(patch) : loadConfig();
-    console.log(`配置已保存到 ${configPath()}；完全退出并由启动器重新打开 Claude 后生效。`);
+    console.log(`配置已保存到 ${configPath()}；完全退出并由原 Claude 入口重新打开后生效。`);
     return printResult(config);
   }
 
+  if (command === 'install-wrapper') return printResult(installWrapper(options.app));
+  if (command === 'remove-wrapper') return printResult(removeWrapper(options.app));
+
+  const appPath = resolveAppPath(options.app);
+
   if (command === 'verify') {
-    return printResult(verifyOfficialSignature(options.app));
+    return printResult(verifyOfficialSignature(appPath));
   }
 
   if (command === 'status') {
     return printResult({
       config: loadConfig(),
-      official: verifyOfficialSignature(options.app),
+      official: verifyOfficialSignature(appPath),
       launch: readJson(runtimeStatePath(), null),
     });
   }
 
   if (command === 'start' || command === 'start-official') {
     const result = startEnvironment({
-      app: options.app,
+      app: appPath,
       skipProcessCheck: options.skipProcessCheck,
     });
     return printResult({
       mode: 'official-signature-environment',
-      pid: result.child.pid,
+      pid: result.pid,
+      activated: result.activated === true,
       timezone: result.config.timezone,
       language: result.config.language,
       signature: result.signature,

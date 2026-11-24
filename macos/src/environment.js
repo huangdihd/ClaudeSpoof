@@ -3,15 +3,11 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawn, spawnSync, execFileSync } = require('node:child_process');
-const { loadConfig, stateHome, writeJson } = require('./config');
+const { spawnSync, execFileSync } = require('node:child_process');
+const { loadConfig, stateHome, readJson, writeJson } = require('./config');
 
 const ANTHROPIC_TEAM_ID = 'Q6L2SF6YDW';
 const HARDWARE_KEY_GROUP = `${ANTHROPIC_TEAM_ID}.com.anthropic.claude.hwkey`;
-
-function errorMessage(error) {
-  return String(error && error.message || error);
-}
 
 function executablePath(appPath) {
   const root = path.resolve(appPath);
@@ -31,8 +27,20 @@ function languageEnvironment(language) {
   return `${language.replace('-', '_')}.UTF-8`;
 }
 
-function launchArguments(config) {
-  return [`--lang=${config.language}`];
+function launchArguments(config, extraArguments = []) {
+  return [
+    `--lang=${config.language}`,
+    ...extraArguments.filter((arg) => !/^--lang=/i.test(String(arg))),
+  ];
+}
+
+function openEnvironmentArgs(config) {
+  return [
+    '--env', `TZ=${config.timezone}`,
+    '--env', `LANG=${languageEnvironment(config.language)}`,
+    '--env', `LC_ALL=${languageEnvironment(config.language)}`,
+    '--env', `LANGUAGE=${config.language}`,
+  ];
 }
 
 function launchEnvironment(config, source = process.env) {
@@ -79,18 +87,52 @@ function verifyOfficialSignature(appPath) {
   };
 }
 
-function assertNotRunning() {
+function isClaudeRunning() {
   const result = spawnSync('/usr/bin/pgrep', ['-x', 'Claude'], { stdio: 'ignore' });
-  if (result.status === 0) {
+  return result.status === 0;
+}
+
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  const result = spawnSync('/bin/ps', ['-p', String(pid), '-o', 'comm='], { encoding: 'utf8' });
+  return result.status === 0 && result.stdout.trim().endsWith('/Claude');
+}
+
+function assertNotRunning() {
+  if (isClaudeRunning()) {
     const error = new Error('Claude 已在运行，无法确认它是否继承英国环境。请先完全退出，再由本启动器打开。');
     error.code = 'CLAUDE_RUNNING';
     throw error;
   }
-  if (result.status !== 1) throw new Error('无法检查 Claude 是否正在运行');
 }
 
 function runtimeStatePath() {
   return path.join(stateHome(), 'environment-launch.json');
+}
+
+function activateManagedRunning(appPath) {
+  const state = readJson(runtimeStatePath(), null);
+  const root = path.resolve(appPath);
+  if (!state || state.running !== true || state.appPath !== root || !isPidAlive(state.pid)) return false;
+  const result = spawnSync('/usr/bin/osascript', [
+    '-e', 'tell application id "com.anthropic.claudefordesktop" to activate',
+  ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  if (result.status !== 0) throw new Error('Claude 已在运行，但激活现有窗口失败');
+  console.log(`[ClaudeSpoof] 已激活由启动器管理的 Claude（pid=${state.pid}）`);
+  return true;
+}
+
+function findClaudePid(timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = spawnSync('/usr/bin/pgrep', ['-x', 'Claude'], { encoding: 'utf8' });
+    if (result.status === 0) {
+      const pid = Number(String(result.stdout).trim().split('\n')[0]);
+      if (Number.isInteger(pid) && pid > 0) return pid;
+    }
+    spawnSync('/bin/sleep', ['0.5'], { stdio: 'ignore' });
+  }
+  return null;
 }
 
 function startEnvironment(options = {}) {
@@ -99,45 +141,40 @@ function startEnvironment(options = {}) {
   if (!config.enabled) throw new Error('ClaudeSpoof 配置已停用，拒绝未伪装启动');
   const appPath = path.resolve(options.app || '/Applications/Claude.app');
   const signature = verifyOfficialSignature(appPath);
-  if (!options.skipProcessCheck) assertNotRunning();
-  const executable = executablePath(appPath);
+  if (!options.skipProcessCheck) {
+    if (isClaudeRunning()) {
+      if (options.activateIfManaged && activateManagedRunning(appPath)) {
+        const state = readJson(runtimeStatePath(), null);
+        return { pid: state ? state.pid : null, activated: true, config, signature, stateFile: runtimeStatePath() };
+      }
+      assertNotRunning();
+    }
+  }
   const stateFile = runtimeStatePath();
-  const child = spawn(executable, launchArguments(config), {
-    cwd: path.dirname(executable),
-    env: launchEnvironment(config),
-    stdio: 'inherit',
-  });
+  const args = [
+    ...openEnvironmentArgs(config),
+    appPath,
+    '--args',
+    ...launchArguments(config, options.extraArguments || []),
+  ];
+  const opened = spawnSync('/usr/bin/open', args, { stdio: 'inherit' });
+  if (opened.error) throw opened.error;
+  if (opened.status !== 0) throw new Error(`open 启动失败（exit ${opened.status}）`);
+  const pid = findClaudePid();
+  if (!pid) throw new Error('Claude 未能通过 LaunchServices 启动');
   writeJson(stateFile, {
     running: true,
-    pid: child.pid,
+    pid,
     appPath,
     timezone: config.timezone,
     language: config.language,
     mode: 'official-signature-environment',
+    launchedVia: 'open',
     signature,
     startedAt: new Date().toISOString(),
   });
-  child.once('error', (error) => {
-    console.error(`[ClaudeSpoof] Claude 启动失败：${errorMessage(error)}`);
-    process.exitCode = 1;
-  });
-  child.once('exit', (code, signal) => {
-    writeJson(stateFile, {
-      running: false,
-      pid: child.pid,
-      appPath,
-      timezone: config.timezone,
-      language: config.language,
-      mode: 'official-signature-environment',
-      startedAt: new Date().toISOString(),
-      exitedAt: new Date().toISOString(),
-      exitCode: code,
-      signal,
-    });
-    console.log(`[ClaudeSpoof] Claude 已退出（code=${code}, signal=${signal}）`);
-  });
-  console.log(`[ClaudeSpoof] 官方签名环境已启动：${config.timezone} / ${config.language}`);
-  return { child, config, signature, stateFile };
+  console.log(`[ClaudeSpoof] 官方签名环境已启动：${config.timezone} / ${config.language}（pid=${pid}）`);
+  return { pid, activated: false, config, signature, stateFile };
 }
 
 module.exports = {
@@ -147,7 +184,12 @@ module.exports = {
   languageEnvironment,
   launchArguments,
   launchEnvironment,
+  openEnvironmentArgs,
   verifyOfficialSignature,
+  isClaudeRunning,
+  isPidAlive,
+  findClaudePid,
+  activateManagedRunning,
   assertNotRunning,
   runtimeStatePath,
   startEnvironment,

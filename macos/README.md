@@ -35,26 +35,44 @@ ClaudeSpoof 2.0 不再修改 Claude 的 ASAR、不替换主入口、不重签 Ap
 
 ## 使用
 
+### 接管原入口（推荐）
+
 完全退出 Claude 后，在 `macos` 目录运行：
 
 ```sh
-zsh 启动\ Claude.command
+zsh 接管\ Claude\ 原入口.command
+# 或
+node src/cli.js install-wrapper
 ```
 
-也可以直接执行：
+接管后原路径 `/Applications/Claude.app` 变成一个同名、同图标的轻量外壳，真正的官方 App 原样移到 `/Applications/.ClaudeSpoof/Claude.app`。之后从启动台、Dock、聚焦或浏览器 `claude://` 链接打开 Claude，都经过外壳进入官方 App：进程名、窗口名、Dock 图标仍是 Claude，且由 LaunchServices 正规启动，窗口自动出现。
 
-```sh
-node src/cli.js start
-```
-
-启动器每次都会先验证：
+外壳每次启动都会先验证：
 
 - `codesign --verify --deep --strict` 通过；
 - `TeamIdentifier=Q6L2SF6YDW`；
 - 存在 `Q6L2SF6YDW.com.anthropic.claude.hwkey` 访问组；
 - 当前没有无法确认环境的 Claude 进程在运行。
 
-任何一项不满足都会拒绝启动，不会静默退回真实时区。
+任何一项不满足都会拒绝启动，不会静默退回真实时区。若由本启动器管理的 Claude 已在运行，再次点击入口只会激活现有窗口，不会重复启动。
+
+恢复官方原入口：
+
+```sh
+zsh 移除\ Claude\ 原入口接管.command
+# 或
+node src/cli.js remove-wrapper
+```
+
+恢复后官方 App 回到 `/Applications/Claude.app`，从任何入口打开都使用系统真实环境。
+
+### 手动启动（不接管入口）
+
+```sh
+node src/cli.js start
+```
+
+此方式只启动本次进程，Dock／Spotlight 等原入口仍指向未伪装的官方 App。
 
 ## 修改配置
 
@@ -97,14 +115,15 @@ node src/cli.js verify
 
 ## 官方更新
 
-官方更新可以正常安装。新版不再监听或改写 App 文件，因此没有更新看门狗；每次启动时都会重新检查当前官方签名。更新后仍应通过本启动器打开。
+官方更新可以正常安装。新版不监听或改写 App 文件，没有更新看门狗；外壳每次启动前都会重新检查官方签名，且启动时会从安装来源自动刷新自身 helper 代码。更新后仍从原入口打开即可。
 
 ## 边界与注意事项
 
-- 必须通过本启动器打开 Claude。Dock、Spotlight、登录项或浏览器链接直接启动官方 App 时，不会继承这套环境。
-- 启动器发现已有 Claude 在运行时不会强行接管；这是为了避免把未伪装的进程误认为已伪装。
-- 本工具只改变当前客户端进程及其子进程的环境，不修改 macOS 系统时区、地区或语言。
+- 接管后必须从原入口（外壳）打开 Claude。直接打开隐藏目录 `/Applications/.ClaudeSpoof/Claude.app` 不继承伪装环境。
+- 外壳只改变当前客户端进程及其子进程的环境，不修改 macOS 系统时区、地区或语言。
+- 由该客户端拉起的 Claude Code、Computer Use 及其他子进程继承同一套 `TZ`／`LANG`；单独在终端运行 `claude` 不继承。
 - 浏览器扩展、独立 Chrome 配置、其他桌面应用及网络出口不在本工具的覆盖范围内。
+- 外壳与官方 App 使用相同 bundle id `com.anthropic.claudefordesktop`，这是启动台、Dock、聚焦和 `claude://` 链接能原样工作的原因；不要同时保留两份会互相覆盖。
 - Cowork 的磁盘空间等独立门槛仍需由客户端满足；设备密钥修复不会绕过这些要求。
 - 配置中的旧字段 `overrideAcceptLanguage` 会被忽略；2.x 由 Chromium 的 `--lang` 统一设置页面语言。
 - 本工具不读取、上传或修改 Claude 的 Cookie、OAuth token、聊天记录和账号目录。

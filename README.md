@@ -13,7 +13,7 @@
 | 平台 | 当前版本 | 实现方式 | 官方客户端文件 | 详细说明 |
 | --- | --- | --- | --- | --- |
 | Android | 1.5.1 | LSPosed hook Android 系统时区、locale 与运营商 API | 不修改 | [android/README.md](android/README.md) |
-| macOS | 2.0.0 | 官方签名进程环境启动器，`TZ` 与 Chromium `--lang` | 不修改 | [macos/README.md](macos/README.md) |
+| macOS | 2.0.0 | 同名外壳接管原入口，LaunchServices `open --env` 传 `TZ` 与 Chromium `--lang` | 不修改 | [macos/README.md](macos/README.md) |
 | Windows | 1.0.2 | 官方进程内存启用临时调试入口，运行时注入并校验 | 不修改 | [windows/README.md](windows/README.md) |
 
 ## 快速开始
@@ -31,10 +31,12 @@ Android 端还覆盖 Claude 会读取的运营商／SIM 元数据，内置英美
 需要 macOS 13+、Node.js 18+、未修改且 Anthropic 官方签名的 Claude。完全退出 Claude 后，在 `macos` 目录运行：
 
 ```sh
-zsh 启动\ Claude.command
+zsh 接管\ Claude\ 原入口.command
+# 或
+node src/cli.js install-wrapper
 ```
 
-启动器会验证官方签名、Anthropic Team ID 和硬件密钥访问组，然后以配置好的时区与语言启动官方 App。它不修改 ASAR、不重签 App、不安装看门狗。详见 [macOS 文档](macos/README.md)。
+接管后，启动台、Dock、聚焦里的 Claude 原入口照常使用，进程与窗口名仍是 Claude；真正的官方 App 原样保留在隐藏的 `.ClaudeSpoof` 目录中。外壳只负责通过 LaunchServices 以 `TZ`／`--lang` 环境启动官方 App，不修改 ASAR、不重签、不看门狗。恢复时运行 `node src/cli.js remove-wrapper`。详见 [macOS 文档](macos/README.md)。
 
 ### Windows
 
@@ -70,7 +72,7 @@ LICENSE     GPL-3.0-or-later
 ## 验证与兼容边界
 
 - Android 主要 hook 系统 API，通常不依赖 Claude 混淆类名。
-- macOS 已在 Electron 45.3.3 上验证 Renderer 继承 `TZ` 与 `--lang`；真实客户端的设备密钥、会话关联和附加文件夹也已实测。直接绕过启动器打开官方 App 不会继承环境。
+- macOS 已在 Electron 45.3.3 上验证 Renderer 继承 `TZ` 与 `--lang`；真实客户端的设备密钥、会话关联和附加文件夹也已实测。接管后从原入口启动即继承环境；直接打开隐藏目录里的官方 App 不会继承。
 - Windows 当前针对 Claude 6.28899.6.0 验证；共享模块或 VM 导出变化会触发失败保护，需要更新适配。
 - Windows VM 覆盖针对由 Claude VM client 创建的进程；不会修改 VM 的 `/etc/localtime`、`/etc/timezone` 或独立系统服务。
 - 时区、语言、运营商只是环境信号的一部分；出口 IP、账号资料、支付信息等仍可能独立存在。
