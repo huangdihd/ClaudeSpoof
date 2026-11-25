@@ -1,6 +1,6 @@
 {
   "name": "claude-spoof-macos-environment",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "private": true,
   "description": "Claude macOS official-signature timezone and locale environment launcher",
   "main": "src/cli.js",

@@ -2,12 +2,14 @@
 'use strict';
 
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 const { loadConfig, stateHome, readJson, writeJson } = require('./config');
 const {
   executablePath,
   languageEnvironment,
+  listClaudePids,
   isPidAlive,
   runtimeStatePath,
   startEnvironment,
@@ -21,7 +23,8 @@ const {
 
 const POLL_INTERVAL_MS = 5000;
 const RETRY_DELAY_MS = 5 * 60 * 1000;
-const WATCHER_VERSION = 1;
+const WATCHER_VERSION = 2;
+const WATCHER_AGENT_LABEL = 'com.arin.claudespoof.watcher';
 
 function watcherPidPath() {
   return path.join(stateHome(), 'watcher.pid');
@@ -31,12 +34,32 @@ function watcherStatusPath() {
   return path.join(stateHome(), 'watcher-status.json');
 }
 
+function watcherAgentPlistPath() {
+  return path.join(os.homedir(), 'Library', 'LaunchAgents', `${WATCHER_AGENT_LABEL}.plist`);
+}
+
 function findClaudePids() {
-  const result = spawnSync('/usr/bin/pgrep', ['-x', 'Claude'], { encoding: 'utf8' });
-  if (result.status !== 0) return [];
-  return String(result.stdout || '').trim().split('\n')
-    .map((value) => Number(value))
-    .filter((pid) => Number.isInteger(pid) && pid > 0);
+  return listClaudePids();
+}
+
+function parseProcessCommandAndEnv(text) {
+  const environment = {};
+  for (const key of ['TZ', 'LANG', 'LC_ALL', 'LANGUAGE']) {
+    const regex = new RegExp(`(?:^|\\s)${key}=([^\\s]+)`, 'g');
+    let lastValue = null;
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+      lastValue = match[1];
+    }
+    environment[key] = lastValue;
+  }
+  const langRegex = /(?:^|\s)--lang=([^\s]+)/g;
+  let languageArgument = null;
+  let langMatch;
+  while ((langMatch = langRegex.exec(text)) !== null) {
+    languageArgument = langMatch[1];
+  }
+  return { environment, languageArgument };
 }
 
 function readProcessDetails(pid) {
@@ -48,18 +71,12 @@ function readProcessDetails(pid) {
     encoding: 'utf8', maxBuffer: 10 * 1024 * 1024,
   });
   if (executable.status !== 0 || environmentAndArguments.status !== 0) return null;
-  const text = environmentAndArguments.stdout || '';
-  const environment = {};
-  for (const key of ['TZ', 'LANG', 'LC_ALL', 'LANGUAGE']) {
-    const match = text.match(new RegExp(`(?:^|\\s)${key}=([^\\s]+)`));
-    environment[key] = match ? match[1] : null;
-  }
-  const language = text.match(/(?:^|\s)--lang=([^\s]+)/);
+  const parsed = parseProcessCommandAndEnv(environmentAndArguments.stdout || '');
   return {
     pid,
     executable: executable.stdout.trim(),
-    environment,
-    languageArgument: language ? language[1] : null,
+    environment: parsed.environment,
+    languageArgument: parsed.languageArgument,
   };
 }
 
@@ -75,8 +92,8 @@ function verifyProcessDetails(details, expected) {
   return { verified: reasons.length === 0, reasons };
 }
 
-function stateMatchesProcess(state, process, appPath, config) {
-  return Boolean(state && state.running === true && state.pid === process.pid
+function stateMatchesProcess(state, proc, appPath, config) {
+  return Boolean(state && state.running === true && state.pid === proc.pid
     && path.resolve(state.appPath || '') === path.resolve(appPath)
     && state.timezone === config.timezone && state.language === config.language
     && state.launchedVia === 'open');
@@ -122,7 +139,7 @@ function inspectInstallation(appPath = '/Applications/Claude.app') {
 function decideAction(snapshot) {
   if (!snapshot.config.enabled) return 'disabled';
   const running = snapshot.processes.length > 0;
-  const allVerified = running && snapshot.processes.every((process) => process.verified);
+  const allVerified = running && snapshot.processes.every((proc) => proc.verified);
   if (!running) return snapshot.wrapperOverwritten ? 'repair-wrapper' : 'idle';
   if (allVerified && !snapshot.wrapperOverwritten) return 'verified';
   return 'restart';
@@ -147,7 +164,6 @@ function isWatcherAlive(pid) {
 }
 
 function parseSavedWatcherPid(saved) {
-  // PID 文件历史上是纯数字，也兼容 { "pid": ... }，避免守护存活却被重复启动。
   const pid = Number(typeof saved === 'number' ? saved : saved && saved.pid);
   return Number.isInteger(pid) && pid > 0 ? pid : null;
 }
@@ -155,6 +171,62 @@ function parseSavedWatcherPid(saved) {
 function currentWatcherPid() {
   const pid = parseSavedWatcherPid(readJson(watcherPidPath(), null));
   return isWatcherAlive(pid) ? pid : null;
+}
+
+function xmlEscape(value) {
+  return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function installWatcherAgent(options = {}) {
+  if (process.platform !== 'darwin') throw new Error('LaunchAgent 只能在 macOS 上安装');
+  const appPath = path.resolve(options.app || '/Applications/Claude.app');
+  const plistPath = watcherAgentPlistPath();
+  fs.mkdirSync(path.dirname(plistPath), { recursive: true });
+  const watcherScript = path.join(stateHome(), 'bin', 'watcher.js');
+  const targetScript = fs.existsSync(watcherScript) ? watcherScript : path.join(__dirname, 'watcher.js');
+  const logFile = path.join(stateHome(), 'watcher-agent.log');
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${WATCHER_AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${xmlEscape(process.execPath)}</string>
+    <string>${xmlEscape(targetScript)}</string>
+    <string>--run</string>
+    <string>--app</string>
+    <string>${xmlEscape(appPath)}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_SPOOF_HOME</key><string>${xmlEscape(stateHome())}</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${xmlEscape(logFile)}</string>
+  <key>StandardErrorPath</key><string>${xmlEscape(logFile)}</string>
+</dict>
+</plist>
+`;
+  fs.writeFileSync(plistPath, plist, { mode: 0o644 });
+  const domain = `gui/${process.getuid()}`;
+  spawnSync('/bin/launchctl', ['bootout', domain, plistPath], { stdio: 'ignore' });
+  const boot = spawnSync('/bin/launchctl', ['bootstrap', domain, plistPath], { encoding: 'utf8' });
+  if (boot.status !== 0) {
+    throw new Error(`安装 LaunchAgent 失败：${(boot.stderr || boot.stdout || '').trim()}`);
+  }
+  return { installed: true, label: WATCHER_AGENT_LABEL, plistPath };
+}
+
+function uninstallWatcherAgent() {
+  if (process.platform !== 'darwin') return { removed: false, plistPath: watcherAgentPlistPath() };
+  const plistPath = watcherAgentPlistPath();
+  if (!fs.existsSync(plistPath)) return { removed: false, plistPath };
+  spawnSync('/bin/launchctl', ['bootout', `gui/${process.getuid()}`, plistPath], { stdio: 'ignore' });
+  fs.rmSync(plistPath, { force: true });
+  return { removed: true, plistPath };
 }
 
 function ensureUpdateWatcher(options = {}) {
@@ -191,11 +263,18 @@ function stopUpdateWatcher() {
   return { stopped: true, pid };
 }
 
-function quitClaudeProcesses() {
-  const result = spawnSync('/usr/bin/osascript', [
-    '-e', 'tell application id "com.anthropic.claudefordesktop" to quit',
-  ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-  if (result.status !== 0) throw new Error(`无法要求 Claude 正常退出：${(result.stderr || '').trim()}`);
+function quitClaudeProcesses(pids = null) {
+  const targetPids = Array.isArray(pids) && pids.length > 0 ? pids : findClaudePids();
+  if (targetPids.length === 0) return;
+
+  // Prefer graceful quit targeted by PID to avoid ambiguity when multiple bundles exist.
+  for (const pid of targetPids) {
+    spawnSync('/usr/bin/osascript', [
+      '-e', `tell application "System Events" to tell (first process whose unix id is ${pid}) to click menu item 1 of menu 1 of menu bar 1`,
+    ], { stdio: 'ignore' });
+    try { process.kill(pid, 'SIGTERM'); } catch (_) {}
+  }
+
   const deadline = Date.now() + 20000;
   while (Date.now() < deadline) {
     if (findClaudePids().length === 0) return;
@@ -206,13 +285,13 @@ function quitClaudeProcesses() {
 
 function recoverLaunchState(snapshot) {
   if (snapshot.processes.length !== 1 || !snapshot.processes[0].verified) return;
-  const process = snapshot.processes[0];
-  if (process.stateMatch) return;
+  const proc = snapshot.processes[0];
+  if (proc.stateMatch) return;
   const previous = readJson(runtimeStatePath(), {});
   writeJson(runtimeStatePath(), {
     ...previous,
     running: true,
-    pid: process.pid,
+    pid: proc.pid,
     appPath: snapshot.realPath,
     timezone: snapshot.config.timezone,
     language: snapshot.config.language,
@@ -222,30 +301,46 @@ function recoverLaunchState(snapshot) {
   });
 }
 
-function repairInstallation(snapshot) {
-  if (snapshot.processes.length > 0) quitClaudeProcesses();
+function repairInstallation(snapshot, deps = {}) {
+  const quit = deps.quitClaudeProcesses || quitClaudeProcesses;
+  const repair = deps.repairWrapper || repairWrapper;
+  const resolve = deps.resolveAppPath || resolveAppPath;
+  const start = deps.startEnvironment || startEnvironment;
+  const readDetails = deps.readProcessDetails || readProcessDetails;
+  const execPath = deps.executablePath || executablePath;
+
+  const hadRunningProcesses = snapshot.processes.length > 0;
+  if (hadRunningProcesses) {
+    quit(snapshot.processes.map((p) => p.pid));
+  }
   let realPath = snapshot.realPath;
   let backupPath = null;
   if (snapshot.wrapperOverwritten) {
-    const repaired = repairWrapper(snapshot.appPath);
+    const repaired = repair(snapshot.appPath);
     realPath = repaired.realPath;
     backupPath = repaired.backupPath;
   } else {
-    realPath = resolveAppPath(snapshot.appPath);
+    realPath = resolve(snapshot.appPath);
   }
-  const result = startEnvironment({ app: realPath, watcherApp: snapshot.appPath });
-  const details = readProcessDetails(result.pid);
+
+  // IMPORTANT: When Claude was closed (action === 'repair-wrapper'), only repair the
+  // wrapper bundle and DO NOT launch Claude unexpectedly.
+  if (!hadRunningProcesses && snapshot.action === 'repair-wrapper') {
+    return { pid: null, backupPath, launched: false };
+  }
+
+  const result = start({ app: realPath, watcherApp: snapshot.appPath });
+  const details = readDetails(result.pid);
   const verification = verifyProcessDetails(details, {
-    executable: executablePath(realPath),
+    executable: execPath(realPath),
     timezone: snapshot.config.timezone,
     language: snapshot.config.language,
   });
   if (!verification.verified) {
-    // 环境继承行为若被新版改变，关闭这次未验证实例并退避，绝不循环重启。
-    quitClaudeProcesses();
+    quit([result.pid]);
     throw new Error(`重开后的环境校验失败：${verification.reasons.join(', ')}`);
   }
-  return { pid: result.pid, backupPath };
+  return { pid: result.pid, backupPath, launched: true };
 }
 
 function writeStatus(value) {
@@ -293,7 +388,7 @@ function runWatcher(appPath) {
         appPath: snapshot.appPath,
         realPath: snapshot.realPath,
         wrapperInstalled: snapshot.wrapperInstalled,
-        claudePids: snapshot.processes.map((process) => process.pid),
+        claudePids: snapshot.processes.map((proc) => proc.pid),
         verified: snapshot.action === 'verified',
         action: snapshot.action,
         processes: snapshot.processes,
@@ -324,8 +419,8 @@ function runWatcher(appPath) {
       nextRepairAt = 0;
       return writeStatus({
         ...base,
-        claudePids: [repaired.pid],
-        verified: true,
+        claudePids: repaired.pid ? [repaired.pid] : [],
+        verified: repaired.launched,
         action: snapshot.action === 'repair-wrapper' ? 'wrapper-repaired' : 'restarted',
         backupPath: repaired.backupPath,
         errorCount,
@@ -348,7 +443,6 @@ function runWatcher(appPath) {
   };
 
   check();
-  // 定时器是守护进程唯一的持久句柄，必须保持事件循环存活。
   setInterval(check, POLL_INTERVAL_MS);
 }
 
@@ -363,14 +457,20 @@ function main() {
 module.exports = {
   POLL_INTERVAL_MS,
   RETRY_DELAY_MS,
+  WATCHER_AGENT_LABEL,
   watcherPidPath,
   watcherStatusPath,
+  watcherAgentPlistPath,
   findClaudePids,
+  parseProcessCommandAndEnv,
   readProcessDetails,
   verifyProcessDetails,
   inspectInstallation,
   decideAction,
+  repairInstallation,
   assertWatcherStartSafe,
+  installWatcherAgent,
+  uninstallWatcherAgent,
   ensureUpdateWatcher,
   stopUpdateWatcher,
   parseSavedWatcherPid,

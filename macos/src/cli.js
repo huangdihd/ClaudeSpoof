@@ -26,6 +26,8 @@ const {
   watcherStatusPath,
   inspectInstallation,
   assertWatcherStartSafe,
+  installWatcherAgent,
+  uninstallWatcherAgent,
   ensureUpdateWatcher,
   stopUpdateWatcher,
   currentWatcherPid,
@@ -43,14 +45,16 @@ function usage() {
   node src/cli.js start [--app /Applications/Claude.app]
   node src/cli.js start-watcher [--app /Applications/Claude.app]
   node src/cli.js stop-watcher
+  node src/cli.js install-agent [--app /Applications/Claude.app]
+  node src/cli.js uninstall-agent
   node src/cli.js verify [--app /Applications/Claude.app]
   node src/cli.js status [--app /Applications/Claude.app]
   node src/cli.js config [--timezone Europe/London] [--language en-GB] [--enabled true|false]
-  node src/cli.js uninstall-agent
 
 install-wrapper 会把官方 App 移到隐藏的 .ClaudeSpoof 目录，并在原路径保留同名、
-同图标的 Claude 启动入口；运行进程与窗口名称仍来自真正的官方 App。
-refresh 只刷新 helper 并启动／重载更新守护，不重启已经验证的 Claude。
+同图标的 Claude 启动入口（优先编译原生 Swift 外壳以支持 claude:// 链接与弹窗提示）；
+运行进程与窗口名称仍来自真正的官方 App。
+install-agent 会安装登录自启的 LaunchAgent，使守护在重启后自动生效。
 
 配置文件：${configPath()}
 `);
@@ -122,6 +126,20 @@ function main() {
   if (command === 'remove-wrapper') return printResult(removeWrapper(options.app));
   if (command === 'stop-watcher') return printResult(stopUpdateWatcher());
 
+  if (command === 'install-agent') {
+    const safe = assertWatcherStartSafe(options.app);
+    stopUpdateWatcher();
+    const agent = installWatcherAgent({ app: options.app });
+    return printResult({ claudeAction: safe.action, agent });
+  }
+
+  if (command === 'uninstall-agent') {
+    const current = uninstallWatcherAgent();
+    const legacy = uninstallLegacyAgent();
+    console.log((current.removed || legacy.removed) ? 'LaunchAgent 守护已移除。' : '未发现已安装的 LaunchAgent。');
+    return printResult({ watcherAgent: current, legacyAgent: legacy });
+  }
+
   if (command === 'refresh') {
     const refreshed = refreshWrapper(options.app);
     const safe = assertWatcherStartSafe(options.app);
@@ -166,12 +184,6 @@ function main() {
       signature: result.signature,
       watcher: result.watcher,
     });
-  }
-
-  if (command === 'uninstall-agent') {
-    const result = uninstallLegacyAgent();
-    console.log(result.removed ? '旧版自动补丁看门狗已移除。' : '未发现旧版自动补丁看门狗。');
-    return printResult(result);
   }
 
   throw new Error(`未知命令：${command}`);

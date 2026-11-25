@@ -3,6 +3,7 @@
   "timezone": "Europe/London",
   "language": "en-GB",
   "overrideAcceptLanguage": true,
+  "requireCoworkVm": false,
   "verifyCoworkVm": false,
   "configureCoworkVm": false,
   "restartCoworkVm": false

@@ -1,6 +1,6 @@
 # ClaudeSpoof macOS：官方签名环境启动器
 
-ClaudeSpoof 2.1 不修改 Claude 的 ASAR、不替换官方主程序、不重签官方 App。它保留 Anthropic 官方签名、Keychain 访问组和硬件密钥 entitlement，只在启动官方进程时传入独立的时区与语言环境。同名外壳负责接管原入口，轻量守护负责识别官方直启、环境不匹配和外壳被更新覆盖。
+ClaudeSpoof 2.2 不修改 Claude 的 ASAR、不替换官方主程序、不重签官方 App。它保留 Anthropic 官方签名、Keychain 访问组和硬件密钥 entitlement，只在启动官方进程时传入独立的时区与语言环境。外壳优先使用原生 Swift 编译（支持 `claude://` URL 转发与原生弹窗提示，无 `swiftc` 时自动回退到增强版 Zsh/Node 外壳），使用独立 Bundle ID 避免与官方 App 冲突，并支持通过 `install-agent` 安装开机登录自启的 LaunchAgent 守护。
 
 默认配置：
 

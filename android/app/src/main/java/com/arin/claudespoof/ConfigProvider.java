@@ -2,17 +2,19 @@ package com.arin.claudespoof;
 
 import android.content.ContentProvider;
 import android.content.ContentValues;
+import android.content.Context;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
+import android.os.Binder;
 
 /**
- * 配置读取的第二通道：Claude 进程通过 content://com.arin.claudespoof.config/config
- * 查询当前配置，直接读模块 App 的 SharedPreferences，总是实时值。
+ * 配置读取的第二通道（仅在 XSharedPreferences 不可读时回退使用）。
  *
- * v1.5 起列扩展为 enabled/timezone/language/country/carrier_name/mccmnc/carrier_id，
- * 模块与 Hook 同版本发布，按固定索引读取。
+ * v1.6 安全加固：通过 Binder.getCallingUid() 严格白名单校验，
+ * 仅允许目标应用（com.anthropic.claude）与模块自身读取，避免暴露给任意第三方 App 或探测脚本。
  */
 public class ConfigProvider extends ContentProvider {
 
@@ -21,11 +23,31 @@ public class ConfigProvider extends ContentProvider {
         return true;
     }
 
+    private boolean isAuthorizedCaller(Context ctx) {
+        if (ctx == null) return false;
+        int callingUid = Binder.getCallingUid();
+        if (callingUid == android.os.Process.myUid()) return true;
+        PackageManager pm = ctx.getPackageManager();
+        if (pm == null) return false;
+        String[] pkgs = pm.getPackagesForUid(callingUid);
+        if (pkgs == null) return false;
+        for (String pkg : pkgs) {
+            if (SpoofConfig.TARGET_PACKAGE.equals(pkg) || SpoofConfig.MODULE_PACKAGE.equals(pkg)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     @Override
     public Cursor query(Uri uri, String[] projection, String selection,
                         String[] selectionArgs, String sortOrder) {
-        SharedPreferences sp = getContext().getSharedPreferences(
-                SpoofConfig.PREFS_NAME, android.content.Context.MODE_PRIVATE);
+        Context ctx = getContext();
+        if (!isAuthorizedCaller(ctx)) {
+            return null;
+        }
+        SharedPreferences sp = ctx.getSharedPreferences(
+                SpoofConfig.PREFS_NAME, Context.MODE_PRIVATE);
         MatrixCursor cursor = new MatrixCursor(new String[]{
                 "enabled", "timezone", "language",
                 "country", "carrier_name", "mccmnc", "carrier_id"});

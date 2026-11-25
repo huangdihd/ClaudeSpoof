@@ -3,14 +3,15 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawnSync } = require('node:child_process');
 const { stateHome, readJson, writeJson } = require('./config');
 const {
   verifyOfficialSignature,
   assertNotRunning,
 } = require('./environment');
 
-const WRAPPER_VERSION = 2;
+const WRAPPER_VERSION = 3;
+const WRAPPER_BUNDLE_ID = 'com.arin.claudespoof.launcher';
 const MARKER_NAME = 'ClaudeSpoofEnvironment.json';
 const HELPER_MODULES = ['config.js', 'environment.js', 'wrapper.js', 'watcher.js'];
 
@@ -59,6 +60,23 @@ function plistValue(appPath, key) {
   }
 }
 
+function resolveIconFile(realRoot, iconName) {
+  const resourcesDir = path.join(realRoot, 'Contents', 'Resources');
+  const candidates = [];
+  if (iconName) {
+    candidates.push(iconName);
+    if (!iconName.toLowerCase().endsWith('.icns')) {
+      candidates.push(`${iconName}.icns`);
+    }
+  }
+  candidates.push('Claude.icns', 'electron.icns', 'icon.icns');
+  for (const name of candidates) {
+    const full = path.join(resourcesDir, name);
+    if (fs.existsSync(full)) return { fileName: name, sourcePath: full };
+  }
+  return null;
+}
+
 function copyHelpers() {
   fs.mkdirSync(helperDir(), { recursive: true, mode: 0o700 });
   for (const name of HELPER_MODULES) {
@@ -68,6 +86,7 @@ function copyHelpers() {
 'use strict';
 
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 
 const app = process.argv[2];
 const extraArguments = process.argv.slice(3);
@@ -78,7 +97,6 @@ if (!app) {
 
 const watcherApp = process.env.CLAUDE_SPOOF_WATCHER_APP || '/Applications/Claude.app';
 const helperSource = process.env.CLAUDE_SPOOF_HELPER_SOURCE;
-// 每次启动先从安装来源刷新 helper，避免仓库更新后 bin 里残留旧代码
 if (helperSource) {
   try {
     for (const name of ${JSON.stringify(HELPER_MODULES)}) {
@@ -87,36 +105,40 @@ if (helperSource) {
   } catch (_) {}
 }
 
-const { startEnvironment } = require('./environment');
-startEnvironment({ app, watcherApp, activateIfManaged: true, extraArguments });
+function showErrorDialog(message) {
+  const safe = String(message || '未知错误').replace(/\\\\/g, '\\\\\\\\').replace(/"/g, '\\\\"');
+  spawnSync('/usr/bin/osascript', [
+    '-e', \`display dialog "ClaudeSpoof 启动失败：\\n\${safe}" buttons {"好"} default button "好" with icon stop\`,
+  ], { stdio: 'ignore' });
+}
+
+try {
+  const { startEnvironment } = require('./environment');
+  startEnvironment({ app, watcherApp, activateIfManaged: true, extraArguments });
+} catch (error) {
+  console.error(error && error.stack ? error.stack : String(error));
+  showErrorDialog(error && error.message ? error.message : String(error));
+  process.exit(1);
+}
 `;
   fs.writeFileSync(helperPath(), launcher, { mode: 0o700 });
 }
 
-function refreshWrapper(appPath) {
-  const root = path.resolve(appPath);
-  const info = wrapperInfo(root);
-  if (!info) throw new Error('该路径不是 ClaudeSpoof 环境启动器');
-  const realPath = path.resolve(info.realPath);
-  const helperSource = path.resolve(__dirname, '..');
-  verifyOfficialSignature(realPath);
-  copyHelpers();
-  // 只更新外层 shell 和 marker；官方 App、当前 Claude 进程及账号数据均不动。
-  fs.writeFileSync(
-    path.join(root, 'Contents', 'MacOS', 'ClaudeSpoof'),
-    wrapperShell(realPath, root, helperSource),
-    { mode: 0o755 },
-  );
-  writeJson(path.join(root, 'Contents', 'Resources', MARKER_NAME), {
-    ...info,
-    version: WRAPPER_VERSION,
-    appPath: root,
-    realPath,
-    helperPath: helperPath(),
-    helperSource,
-    refreshedAt: new Date().toISOString(),
-  });
-  return { status: 'refreshed', appPath: root, realPath, helperPath: helperPath() };
+function tryBuildNativeLauncher(targetExecutablePath) {
+  if (process.platform !== 'darwin') return false;
+  const swiftSource = path.resolve(__dirname, '..', 'native', 'ClaudeSpoofLauncher.swift');
+  if (!fs.existsSync(swiftSource)) return false;
+  const check = spawnSync('/usr/bin/xcrun', ['--find', 'swiftc'], { encoding: 'utf8' });
+  if (check.status !== 0) return false;
+  const compile = spawnSync('/usr/bin/swiftc', [
+    '-O',
+    '-framework', 'AppKit',
+    swiftSource,
+    '-o', targetExecutablePath,
+  ], { encoding: 'utf8' });
+  if (compile.status !== 0) return false;
+  fs.chmodSync(targetExecutablePath, 0o755);
+  return true;
 }
 
 function wrapperShell(realPath, appPath, helperSource) {
@@ -128,7 +150,16 @@ REAL_APP=${JSON.stringify(path.resolve(realPath))}
 export CLAUDE_SPOOF_WATCHER_APP=${JSON.stringify(path.resolve(appPath))}
 export CLAUDE_SPOOF_HELPER_SOURCE=${JSON.stringify(path.resolve(helperSource))}
 NODE_BIN=""
-for candidate in /opt/homebrew/bin/node /usr/local/bin/node \$HOME/.nvm/versions/node/*/bin/node(N) /usr/bin/node; do
+for candidate in \\
+  /opt/homebrew/bin/node \\
+  /usr/local/bin/node \\
+  /opt/local/bin/node \\
+  "\$HOME/.volta/bin/node" \\
+  "\$HOME/.asdf/shims/node" \\
+  "\$HOME/.local/share/mise/shims/node" \\
+  "\$HOME/.local/share/fnm/aliases/default/bin/node" \\
+  "\$HOME"/.nvm/versions/node/*/bin/node(NOn) \\
+  /usr/bin/node; do
   if [[ -x \$candidate ]]; then
     NODE_BIN=\$candidate
     break
@@ -136,16 +167,19 @@ for candidate in /opt/homebrew/bin/node /usr/local/bin/node \$HOME/.nvm/versions
 done
 if [[ -z \$NODE_BIN ]]; then
   echo "ClaudeSpoof: 未找到 node，请先安装 Node.js 18+" >&2
-  /usr/bin/osascript -e 'display dialog "ClaudeSpoof 启动器需要 Node.js（node 18+），请先安装后再打开 Claude。" buttons {"OK"} default button "OK" with icon stop' >/dev/null 2>&1 || true
+  /usr/bin/osascript -e 'display dialog "ClaudeSpoof 启动器需要 Node.js（node 18+）或 Xcode 命令行工具（swiftc），请先安装后再打开 Claude。" buttons {"OK"} default button "OK" with icon stop' >/dev/null 2>&1 || true
   exit 1
 fi
 exec "\$NODE_BIN" "\$HELPER" "\$REAL_APP" "\$@"
 `;
 }
 
-function wrapperInfoPlist(realPath, iconName) {
+function wrapperInfoPlist(realPath, iconFileName, iconName) {
   const shortVersion = plistValue(realPath, 'CFBundleShortVersionString') || '0.0.0';
   const version = plistValue(realPath, 'CFBundleVersion') || '0';
+  const iconNameEntry = iconName
+    ? `  <key>CFBundleIconName</key><string>${xml(iconName)}</string>\n`
+    : '';
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -153,19 +187,66 @@ function wrapperInfoPlist(realPath, iconName) {
   <key>CFBundleDevelopmentRegion</key><string>en</string>
   <key>CFBundleDisplayName</key><string>Claude</string>
   <key>CFBundleExecutable</key><string>ClaudeSpoof</string>
-  <key>CFBundleIconFile</key><string>${xml(iconName || 'Claude')}</string>
-  <key>CFBundleIdentifier</key><string>com.anthropic.claudefordesktop</string>
+  <key>CFBundleIconFile</key><string>${xml(iconFileName || 'Claude.icns')}</string>
+${iconNameEntry}  <key>CFBundleIdentifier</key><string>${WRAPPER_BUNDLE_ID}</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Claude</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${xml(shortVersion)}</string>
   <key>CFBundleSignature</key><string>????</string>
   <key>CFBundleVersion</key><string>${xml(version)}</string>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key><string>Claude URL</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>claude</string>
+      </array>
+    </dict>
+  </array>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>
 `;
+}
+
+function writeWrapperExecutable(execFile, realPath, appPath, helperSource) {
+  if (tryBuildNativeLauncher(execFile)) {
+    return 'native-swift';
+  }
+  fs.writeFileSync(execFile, wrapperShell(realPath, appPath, helperSource), { mode: 0o755 });
+  return 'zsh-node';
+}
+
+function refreshWrapper(appPath) {
+  const root = path.resolve(appPath);
+  const info = wrapperInfo(root);
+  if (!info) throw new Error('该路径不是 ClaudeSpoof 环境启动器');
+  const realPath = path.resolve(info.realPath);
+  const helperSource = path.resolve(__dirname, '..');
+  verifyOfficialSignature(realPath);
+  copyHelpers();
+  const execFile = path.join(root, 'Contents', 'MacOS', 'ClaudeSpoof');
+  const launcherKind = writeWrapperExecutable(execFile, realPath, root, helperSource);
+  const iconFile = resolveIconFile(realPath, plistValue(realPath, 'CFBundleIconFile'));
+  const iconName = plistValue(realPath, 'CFBundleIconName');
+  fs.writeFileSync(
+    path.join(root, 'Contents', 'Info.plist'),
+    wrapperInfoPlist(realPath, iconFile ? iconFile.fileName : 'Claude.icns', iconName),
+  );
+  writeJson(path.join(root, 'Contents', 'Resources', MARKER_NAME), {
+    ...info,
+    version: WRAPPER_VERSION,
+    launcherKind,
+    appPath: root,
+    realPath,
+    helperPath: helperPath(),
+    helperSource,
+    refreshedAt: new Date().toISOString(),
+  });
+  return { status: 'refreshed', launcherKind, appPath: root, realPath, helperPath: helperPath() };
 }
 
 function createWrapperApp(appPath, realPath) {
@@ -179,25 +260,38 @@ function createWrapperApp(appPath, realPath) {
   fs.mkdirSync(resources, { recursive: true });
   fs.mkdirSync(macos, { recursive: true });
 
-  const iconName = plistValue(realRoot, 'CFBundleIconFile') || 'Claude';
-  const iconSource = path.join(realRoot, 'Contents', 'Resources', iconName);
-  if (fs.existsSync(iconSource)) fs.copyFileSync(iconSource, path.join(resources, iconName));
-  fs.writeFileSync(path.join(contents, 'Info.plist'), wrapperInfoPlist(realRoot, iconName));
+  const iconFile = resolveIconFile(realRoot, plistValue(realRoot, 'CFBundleIconFile'));
+  if (iconFile) {
+    fs.copyFileSync(iconFile.sourcePath, path.join(resources, iconFile.fileName));
+  }
+  const assetsCar = path.join(realRoot, 'Contents', 'Resources', 'Assets.car');
+  if (fs.existsSync(assetsCar)) {
+    fs.copyFileSync(assetsCar, path.join(resources, 'Assets.car'));
+  }
+  const iconName = plistValue(realRoot, 'CFBundleIconName');
+
   fs.writeFileSync(
+    path.join(contents, 'Info.plist'),
+    wrapperInfoPlist(realRoot, iconFile ? iconFile.fileName : 'Claude.icns', iconName),
+  );
+  const helperSource = path.resolve(__dirname, '..');
+  const launcherKind = writeWrapperExecutable(
     path.join(macos, 'ClaudeSpoof'),
-    wrapperShell(realRoot, root, path.resolve(__dirname, '..')),
-    { mode: 0o755 },
+    realRoot,
+    root,
+    helperSource,
   );
   writeJson(path.join(resources, MARKER_NAME), {
     kind: 'ClaudeSpoofEnvironment',
     version: WRAPPER_VERSION,
+    launcherKind,
     appPath: root,
     realPath: realRoot,
     helperPath: helperPath(),
-    helperSource: path.resolve(__dirname, '..'),
+    helperSource,
     createdAt: new Date().toISOString(),
   });
-  return temporaryPath;
+  return { temporaryPath, launcherKind };
 }
 
 function installWrapper(appPath) {
@@ -210,7 +304,7 @@ function installWrapper(appPath) {
   assertNotRunning();
   fs.mkdirSync(path.dirname(realPath), { recursive: true });
   fs.renameSync(root, realPath);
-  const temporaryPath = createWrapperApp(root, realPath);
+  const { temporaryPath, launcherKind } = createWrapperApp(root, realPath);
   try {
     copyHelpers();
     fs.renameSync(temporaryPath, root);
@@ -221,6 +315,7 @@ function installWrapper(appPath) {
   }
   return {
     status: 'installed',
+    launcherKind,
     appPath: root,
     realPath,
     helperPath: helperPath(),
@@ -243,10 +338,13 @@ function repairWrapper(appPath) {
   fs.renameSync(realPath, backupPath);
   let movedOfficial = false;
   let temporaryPath = null;
+  let launcherKind = 'zsh-node';
   try {
     fs.renameSync(root, realPath);
     movedOfficial = true;
-    temporaryPath = createWrapperApp(root, realPath);
+    const built = createWrapperApp(root, realPath);
+    temporaryPath = built.temporaryPath;
+    launcherKind = built.launcherKind;
     copyHelpers();
     fs.renameSync(temporaryPath, root);
   } catch (error) {
@@ -255,7 +353,7 @@ function repairWrapper(appPath) {
     if (!fs.existsSync(realPath) && fs.existsSync(backupPath)) fs.renameSync(backupPath, realPath);
     throw error;
   }
-  return { status: 'repaired', appPath: root, realPath, backupPath, helperPath: helperPath() };
+  return { status: 'repaired', launcherKind, appPath: root, realPath, backupPath, helperPath: helperPath() };
 }
 
 function removeWrapper(appPath) {
@@ -266,7 +364,8 @@ function removeWrapper(appPath) {
   const realPath = path.resolve(info.realPath);
   verifyOfficialSignature(realPath);
   assertNotRunning();
-  const { stopUpdateWatcher } = require('./watcher');
+  const { stopUpdateWatcher, uninstallWatcherAgent } = require('./watcher');
+  uninstallWatcherAgent();
   stopUpdateWatcher();
   const temporaryPath = path.join(path.dirname(root), `.ClaudeSpoof-remove-${process.pid}.app`);
   fs.rmSync(temporaryPath, { recursive: true, force: true });
@@ -284,8 +383,11 @@ function removeWrapper(appPath) {
 
 module.exports = {
   WRAPPER_VERSION,
+  WRAPPER_BUNDLE_ID,
   wrapperInfo,
   resolveAppPath,
+  resolveIconFile,
+  wrapperInfoPlist,
   defaultRealPath,
   installWrapper,
   refreshWrapper,

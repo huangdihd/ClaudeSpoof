@@ -12,7 +12,10 @@ function Read-JsonFile([string]$path) {
 
 function Write-Status($state) {
     try {
-        [IO.File]::WriteAllText($statusPath, ($state | ConvertTo-Json -Depth 5))
+        $json = ($state | ConvertTo-Json -Depth 5)
+        $tmp = "$statusPath.tmp-$PID"
+        [IO.File]::WriteAllText($tmp, $json)
+        Move-Item -LiteralPath $tmp -Destination $statusPath -Force
     } catch {}
 }
 
@@ -24,11 +27,12 @@ function Get-OfficialClaudePath {
     return $executable
 }
 
-function Test-VerifiedProcess($verification, $config, $processes) {
+function Test-VerifiedProcess($verification, $config, $processes, [string]$officialExe) {
     if ($null -eq $verification -or $null -eq $verification.main) { return $false }
     $mainProcessId = 0
     if (-not [int]::TryParse([string]$verification.main.processId, [ref]$mainProcessId)) { return $false }
     if ($mainProcessId -notin @($processes | ForEach-Object { $_.ProcessId })) { return $false }
+    if ($verification.main.officialExe -and ($verification.main.officialExe -ne $officialExe)) { return $false }
     if ($verification.main.envTZ -ne $config.timezone -or $verification.main.timeZone -ne $config.timezone) { return $false }
     if ($verification.main.electronLocale -ne $config.language) { return $false }
     if ($verification.sharedTimezoneProvider.resolvedTimeZone -ne $config.timezone) { return $false }
@@ -44,12 +48,39 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $hashBytes = [Security.Cryptography.SHA256]::Create().ComputeHash(
     [Text.Encoding]::UTF8.GetBytes(($identity + '|' + $runtime).ToLowerInvariant())
 )
-$mutexName = 'Local\ClaudeSpoofWatcher-' + ([BitConverter]::ToString($hashBytes).Replace('-', '').Substring(0, 20))
+$runtimeKey = [BitConverter]::ToString($hashBytes).Replace('-', '').Substring(0, 20)
+$mutexName = 'Local\ClaudeSpoofWatcher-' + $runtimeKey
+$launchMutexName = 'Local\ClaudeSpoofLaunch-' + $runtimeKey
+
 $created = $false
 $mutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$created)
 if (-not $created) { exit 0 }
 
-$lastAttemptKey = $null
+function Test-LaunchInProgress {
+    $probe = $null
+    $acquired = $false
+    try {
+        if ([System.Threading.Mutex]::TryOpenExisting($launchMutexName, [ref]$probe)) {
+            try {
+                $acquired = $probe.WaitOne(0)
+                return (-not $acquired)
+            } catch [System.Threading.AbandonedMutexException] {
+                $acquired = $true
+                return $false
+            }
+        }
+        return $false
+    } catch {
+        return $false
+    } finally {
+        if ($null -ne $probe) {
+            if ($acquired) { try { $probe.ReleaseMutex() } catch {} }
+            $probe.Dispose()
+        }
+    }
+}
+
+$pendingRepairKey = $null
 $retryAfter = [DateTime]::UtcNow
 try {
     while ($true) {
@@ -60,24 +91,41 @@ try {
                 exit 0
             }
 
+            # Lightweight idle check: avoid querying Appx & WMI when Claude is not running.
+            $quickProcs = @(Get-Process -Name 'Claude' -ErrorAction SilentlyContinue)
+            if ($quickProcs.Count -eq 0) {
+                $pendingRepairKey = $null
+                $retryAfter = [DateTime]::UtcNow
+                Write-Status ([ordered]@{ running = $true; watching = $false; checkedAtUtc = [DateTime]::UtcNow.ToString('o') })
+                Start-Sleep -Seconds 5
+                continue
+            }
+
+            if (Test-LaunchInProgress) {
+                $pendingRepairKey = $null
+                Write-Status ([ordered]@{ running = $true; watching = $true; action = 'launchInProgress'; checkedAtUtc = [DateTime]::UtcNow.ToString('o') })
+                Start-Sleep -Seconds 5
+                continue
+            }
+
             $official = Get-OfficialClaudePath
             $processes = @()
             if ($null -ne $official) {
-                $processes = @(Get-CimInstance Win32_Process | Where-Object {
-                    $_.Name -eq 'Claude.exe' -and $_.ExecutablePath -eq $official
+                $processes = @(Get-CimInstance Win32_Process -Filter "Name='Claude.exe'" | Where-Object {
+                    $_.ExecutablePath -eq $official
                 })
             }
 
             # Never start Claude just because the watcher is running. It only
             # intervenes after the official client has started itself.
             if ($processes.Count -eq 0) {
-                $lastAttemptKey = $null
+                $pendingRepairKey = $null
                 $retryAfter = [DateTime]::UtcNow
                 Write-Status ([ordered]@{ running = $true; watching = $false; checkedAtUtc = [DateTime]::UtcNow.ToString('o') })
             } else {
                 $verification = Read-JsonFile $verificationPath
-                if (Test-VerifiedProcess $verification $config $processes) {
-                    $lastAttemptKey = $null
+                if (Test-VerifiedProcess $verification $config $processes $official) {
+                    $pendingRepairKey = $null
                     $retryAfter = [DateTime]::UtcNow
                     Write-Status ([ordered]@{
                         running = $true
@@ -92,8 +140,31 @@ try {
                     $root = $processes | Where-Object { $_.ParentProcessId -notin $processIds } |
                         Sort-Object CreationDate | Select-Object -First 1
                     $attemptKey = $official + '|' + $(if ($null -ne $root) { $root.ProcessId } else { 'unknown' })
-                    if ([DateTime]::UtcNow -ge $retryAfter) {
-                        $lastAttemptKey = $attemptKey
+
+                    if ([DateTime]::UtcNow -lt $retryAfter) {
+                        Write-Status ([ordered]@{
+                            running = $true
+                            watching = $true
+                            verified = $false
+                            action = 'repairFailedBackoff'
+                            officialExe = $official
+                            retryAfterUtc = $retryAfter.ToString('o')
+                            checkedAtUtc = [DateTime]::UtcNow.ToString('o')
+                        })
+                    } elseif ($pendingRepairKey -ne $attemptKey) {
+                        # Two-consecutive-checks confirmation avoids racing with a fresh launch or shutdown.
+                        $pendingRepairKey = $attemptKey
+                        Write-Status ([ordered]@{
+                            running = $true
+                            watching = $true
+                            verified = $false
+                            action = 'pendingRepairConfirmation'
+                            officialExe = $official
+                            attemptKey = $attemptKey
+                            checkedAtUtc = [DateTime]::UtcNow.ToString('o')
+                        })
+                    } else {
+                        $pendingRepairKey = $null
                         Write-Status ([ordered]@{
                             running = $true
                             watching = $true

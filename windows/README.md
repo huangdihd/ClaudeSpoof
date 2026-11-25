@@ -67,9 +67,11 @@
 
 ## 工作方式与安全边界
 
-- 启动器挂起创建官方 `Claude.exe`，只在新进程的内存中把 Electron `nodeCliInspect` fuse 从 `0` 改为 `1`，不写回官方 EXE 或 ASAR。
-- 注入完成后关闭临时调试端口 `127.0.0.1:19229`。
-- 若签名校验、provider、Renderer、Cowork 服务身份或运行时检查失败，会结束本次由启动器创建的官方进程，而不是静默使用真实系统时区。
+- 启动器在进程创建前注入 `TZ` 与 `--lang=`，挂起创建官方 `Claude.exe`，优先扫描 PE 数据节并校验 Electron Fuse 版本字节后，只在新进程内存中把 `nodeCliInspect` fuse 从 `0` 改为 `1`，不写回官方 EXE 或 ASAR。
+- 使用动态分配的临时空闲回环端口进行注入，注入完成后立即关闭调试端口。
+- Cowork VM 管道拦截改为定向包装 `\\.\pipe\cowork-vm-service` 并带完整长度前缀帧缓冲，不修改全局 `net.Socket.prototype.write`；`Accept-Language` 同时通过 `session.webRequest.onBeforeSendHeaders` 覆盖所有请求。
+- 启动器与更新守护共享 Named Mutex，且守护采用连续两次确认防抖与轻量空闲轮询，避免互杀竞态；并校验官方 EXE 签发主体为 Anthropic，可选注册用户级登录自启计划任务 `ClaudeSpoofWatcher`。
+- 若签名校验、provider、Renderer、Cowork 服务身份（启用或服务可用时）或运行时检查失败，会结束本次由启动器创建的官方进程，而不是静默使用真实系统时区。
 - 进程内存补丁和回环调试器可能触发安全软件告警；发布包同时提供完整 C# 与 JavaScript 源码以便审计。
 - 运行时目录会生成本地验证 JSON，不包含聊天内容或账号凭据。
 

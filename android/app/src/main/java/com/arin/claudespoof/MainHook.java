@@ -7,9 +7,18 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.LocaleList;
+import android.os.SystemClock;
+import android.system.Os;
+import android.telephony.SubscriptionInfo;
+import android.telephony.TelephonyManager;
 
 import java.util.Locale;
+import java.util.Map;
 import java.util.TimeZone;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -19,72 +28,56 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * Claude (com.anthropic.claude) 时区 / 语言伪装。
+ * Claude (com.anthropic.claude) 时区 / 语言 / 运营商元数据伪装。
  *
- * 逆向依据（版本 1.261104.19）：
- *  - 聊天发送请求 SendChannelMessageRequest 带 sender_timezone 字段；
- *  - 时区提供器 defpackage.ts0：getID() 与 getOffset() 均来自 java.util.TimeZone.getDefault()；
- *  - 其接口 defpackage.neg 的 kotlinx 时区对象走 java.time.ZoneId.systemDefault()；
- *  - 语言走 Locale / LocaleList / Configuration / ICU。
- *
- * v1.2：
- *  - 配置双通道：XSharedPreferences + ContentProvider 互备，读取成功会打来源日志；
- *  - 语言补充 createConfigurationContext 与 per-app 语言 API 两条路径；
- *  - 配置值变化时打日志，便于排查。
+ * v1.6 架构重构：
+ *  - 不可变 ConfigSnapshot + volatile 无锁热路径 + 后台单线程异步刷新，彻底消除 UI 线程阻塞与锁竞争；
+ *  - 修复 XSharedPreferences 无权限时假成功导致 ContentProvider 降级失效的 Bug；
+ *  - 通过 Os.setenv("TZ", ...) 同步覆盖 native 层与 WebView/Chromium 时区；
+ *  - 补全 TimeZone.getDefaultRef()、ULocale.getDefault(Category)、System.getProperty、
+ *    TelephonyManager 双卡 slotIndex 重载、SubscriptionInfo 与 Configuration.mcc/mnc；
+ *  - 运营商国家码遵循 Android 标准返回小写 ISO 码；不再原地篡改共享 Configuration 实例。
  */
 public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "ClaudeSpoof";
-    private static final long RELOAD_INTERVAL_MS = 3000;
+    private static final long RELOAD_INTERVAL_MS = 3000L;
     private static final Uri CONFIG_URI = Uri.parse("content://com.arin.claudespoof.config/config");
 
     private ClassLoader appClassLoader;
     private XSharedPreferences prefs;
-    private Context appContext;
-    private long lastReload;
+    private volatile Context appContext;
+    private volatile String originalNativeTz;
+    private volatile boolean originalNativeTzCaptured = false;
 
-    private volatile boolean enabled = SpoofConfig.ENABLED;
-    private volatile String tzId = SpoofConfig.TIMEZONE_ID;
-    private volatile String langTag = SpoofConfig.LANGUAGE_TAG;
-    private volatile Locale spoofLocale = Locale.forLanguageTag(SpoofConfig.LANGUAGE_TAG);
-    private volatile TimeZone spoofTz = TimeZone.getTimeZone(SpoofConfig.TIMEZONE_ID);
+    private volatile ConfigSnapshot current = ConfigSnapshot.defaultSnapshot();
+    private volatile long lastReloadElapsed = 0L;
+    private final AtomicBoolean refreshing = new AtomicBoolean(false);
+    private volatile String lastLogSignature = "";
 
-    /** v1.5：运营商 / SIM 伪装值 */
-    private volatile String carrierCountry = SpoofConfig.COUNTRY;
-    private volatile String carrierName = SpoofConfig.CARRIER_NAME;
-    private volatile String mccMnc = SpoofConfig.MCCMNC;
-    private volatile int carrierId = SpoofConfig.CARRIER_ID;
-
-    private String lastLogSignature = "";
-    private final java.util.HashMap<String, Integer> dbgCounts = new java.util.HashMap<>();
-
-    private void debugLocales(XC_MethodHook.MethodHookParam param) {
-        int n = dbg("cfg.getLocales");
-        if (n <= 2) log("debug cfg.getLocales -> " + param.getResult());
-        if (n == 1) {
-            StringBuilder sb = new StringBuilder("debug stack:");
-            StackTraceElement[] st = new Throwable().getStackTrace();
-            for (int i = 0; i < st.length && i < 14; i++) {
-                sb.append("\n  ").append(st[i].getClassName()).append('.').append(st[i].getMethodName());
-            }
-            log(sb.toString());
+    private final ExecutorService reloadExecutor = Executors.newSingleThreadExecutor(new ThreadFactory() {
+        @Override
+        public Thread newThread(Runnable r) {
+            Thread t = new Thread(r, "ClaudeSpoof-ConfigReload");
+            t.setDaemon(true);
+            return t;
         }
-    }
-
-    private int dbg(String key) {
-        Integer v = dbgCounts.get(key);
-        int n = v == null ? 1 : v + 1;
-        dbgCounts.put(key, n);
-        return n;
-    }
+    });
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!SpoofConfig.TARGET_PACKAGE.equals(lpparam.packageName)) return;
 
         appClassLoader = lpparam.classLoader;
-        refreshConfig(true);
-        log("active in process " + lpparam.processName + " tz=" + tzId + " lang=" + langTag);
+        captureOriginalNativeTz();
+        reloadConfigSync();
+
+        ConfigSnapshot snap = current;
+        log("active in process " + lpparam.processName
+                + " enabled=" + snap.enabled
+                + " tz=" + snap.tzId
+                + " lang=" + snap.langTag
+                + " country=" + snap.countryLower);
 
         hookJavaTimeZone();
         hookZoneId();
@@ -96,37 +89,88 @@ public class MainHook implements IXposedHookLoadPackage {
         hookPerAppLocales();
         hookIcu();
         hookSystemProperties();
+        hookSystemGetProperty();
         hookTelephonyManager();
+        hookSubscriptionInfo();
     }
 
-    /** 双通道读取配置；任一通道成功即采用，值变化时打日志 */
-    private synchronized void refreshConfig(boolean force) {
-        long now = System.currentTimeMillis();
-        if (!force && now - lastReload < RELOAD_INTERVAL_MS) return;
-        lastReload = now;
+    /** 热路径完全无锁：直接返回当前不可变快照，到期后异步触发后台刷新 */
+    private ConfigSnapshot getConfig() {
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastReloadElapsed >= RELOAD_INTERVAL_MS
+                && refreshing.compareAndSet(false, true)) {
+            lastReloadElapsed = now;
+            try {
+                reloadExecutor.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            reloadConfigSync();
+                        } finally {
+                            refreshing.set(false);
+                        }
+                    }
+                });
+            } catch (Throwable ignored) {
+                refreshing.set(false);
+            }
+        }
+        return current;
+    }
+
+    private void captureOriginalNativeTz() {
+        if (originalNativeTzCaptured) return;
+        try {
+            originalNativeTz = Os.getenv("TZ");
+        } catch (Throwable ignored) {
+        }
+        originalNativeTzCaptured = true;
+    }
+
+    private void applyNativeTz(ConfigSnapshot snap) {
+        try {
+            if (snap.enabled) {
+                Os.setenv("TZ", snap.tzId, true);
+            } else if (originalNativeTz != null && !originalNativeTz.isEmpty()) {
+                Os.setenv("TZ", originalNativeTz, true);
+            } else {
+                Os.unsetenv("TZ");
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 仅在初始化或后台单线程中执行，绝不阻塞 UI 线程或 Hook 调用方 */
+    private void reloadConfigSync() {
+        lastReloadElapsed = SystemClock.elapsedRealtime();
 
         Boolean en = null;
         String tz = null, lang = null, country = null, carrier = null, mcc = null, source = null;
         Integer cid = null;
 
-        // 通道一：XSharedPreferences
+        // 通道一：XSharedPreferences（校验文件真正可读且含有效键，避免无权限时假成功）
         try {
             if (prefs == null) {
                 prefs = new XSharedPreferences(SpoofConfig.MODULE_PACKAGE, SpoofConfig.PREFS_NAME);
             }
             prefs.reload();
-            en = prefs.getBoolean(SpoofConfig.KEY_ENABLED, SpoofConfig.ENABLED);
-            tz = prefs.getString(SpoofConfig.KEY_TIMEZONE, SpoofConfig.TIMEZONE_ID);
-            lang = prefs.getString(SpoofConfig.KEY_LANGUAGE, SpoofConfig.LANGUAGE_TAG);
-            country = prefs.getString(SpoofConfig.KEY_COUNTRY, SpoofConfig.COUNTRY);
-            carrier = prefs.getString(SpoofConfig.KEY_CARRIER_NAME, SpoofConfig.CARRIER_NAME);
-            mcc = prefs.getString(SpoofConfig.KEY_MCCMNC, SpoofConfig.MCCMNC);
-            cid = prefs.getInt(SpoofConfig.KEY_CARRIER_ID, SpoofConfig.CARRIER_ID);
-            source = "xsp";
+            if (prefs.getFile().canRead()) {
+                Map<String, ?> all = prefs.getAll();
+                if (all != null && !all.isEmpty()) {
+                    en = prefs.getBoolean(SpoofConfig.KEY_ENABLED, SpoofConfig.ENABLED);
+                    tz = prefs.getString(SpoofConfig.KEY_TIMEZONE, SpoofConfig.TIMEZONE_ID);
+                    lang = prefs.getString(SpoofConfig.KEY_LANGUAGE, SpoofConfig.LANGUAGE_TAG);
+                    country = prefs.getString(SpoofConfig.KEY_COUNTRY, SpoofConfig.COUNTRY);
+                    carrier = prefs.getString(SpoofConfig.KEY_CARRIER_NAME, SpoofConfig.CARRIER_NAME);
+                    mcc = prefs.getString(SpoofConfig.KEY_MCCMNC, SpoofConfig.MCCMNC);
+                    cid = prefs.getInt(SpoofConfig.KEY_CARRIER_ID, SpoofConfig.CARRIER_ID);
+                    source = "xsp";
+                }
+            }
         } catch (Throwable ignored) {
         }
 
-        // 通道二：ContentProvider（通道一失败时）
+        // 通道二：ContentProvider（通道一未读到有效数据时回退）
         if (source == null) {
             Cursor c = null;
             try {
@@ -155,25 +199,31 @@ public class MainHook implements IXposedHookLoadPackage {
         }
 
         if (source == null) {
-            logOnce("config-read-failed", "config read failed on both channels, keep tz="
-                    + tzId + " lang=" + langTag);
+            ConfigSnapshot prev = current;
+            applyNativeTz(prev);
+            logOnce("config-read-failed|" + prev.tzId + "|" + prev.langTag,
+                    "config read failed on both channels, keep tz=" + prev.tzId + " lang=" + prev.langTag);
             return;
         }
 
-        if (en != null) enabled = en;
-        if (tz != null && !tz.isEmpty()) tzId = tz;
-        if (lang != null && !lang.isEmpty()) langTag = lang;
-        if (country != null && !country.isEmpty()) carrierCountry = country;
-        if (carrier != null && !carrier.isEmpty()) carrierName = carrier;
-        if (mcc != null && !mcc.isEmpty()) mccMnc = mcc;
-        if (cid != null) carrierId = cid;
-        spoofLocale = Locale.forLanguageTag(langTag);
-        spoofTz = TimeZone.getTimeZone(tzId);
+        ConfigSnapshot next = new ConfigSnapshot(
+                en != null ? en : SpoofConfig.ENABLED,
+                tz, lang, country, carrier, mcc,
+                cid != null ? cid : SpoofConfig.CARRIER_ID,
+                source
+        );
+        current = next;
+        applyNativeTz(next);
 
-        logOnce(source + "|" + enabled + "|" + tzId + "|" + langTag + "|" + carrierCountry
-                        + "|" + carrierName + "|" + mccMnc,
-                "config <- " + source + ": enabled=" + enabled + " tz=" + tzId + " lang=" + langTag
-                        + " country=" + carrierCountry + " carrier=" + carrierName + " mccmnc=" + mccMnc);
+        logOnce(next.logSignature,
+                "config <- " + next.source
+                        + ": enabled=" + next.enabled
+                        + " tz=" + next.tzId
+                        + " lang=" + next.langTag
+                        + " country=" + next.countryLower
+                        + " carrier=" + next.carrierName
+                        + " mccmnc=" + next.mccMnc
+                        + " carrierId=" + next.carrierId);
     }
 
     private void logOnce(String signature, String msg) {
@@ -186,13 +236,25 @@ public class MainHook implements IXposedHookLoadPackage {
         safe("TimeZone.getDefault", new Runnable() {
             @Override
             public void run() {
-                XposedHelpers.findAndHookMethod(TimeZone.class, "getDefault", new XC_MethodHook() {
+                XC_MethodHook hook = new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        refreshConfig(false);
-                        if (enabled) param.setResult(spoofTz);
+                        ConfigSnapshot snap = getConfig();
+                        if (snap.enabled) param.setResult(snap.timeZone.clone());
                     }
-                });
+                };
+                XposedHelpers.findAndHookMethod(TimeZone.class, "getDefault", hook);
+                // AOSP Calendar.getInstance() / SimpleDateFormat 直接调 getDefaultRef()
+                try {
+                    XposedHelpers.findAndHookMethod(TimeZone.class, "getDefaultRef", new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            ConfigSnapshot snap = getConfig();
+                            if (snap.enabled) param.setResult(snap.timeZone);
+                        }
+                    });
+                } catch (Throwable ignored) {
+                }
             }
         });
     }
@@ -205,8 +267,10 @@ public class MainHook implements IXposedHookLoadPackage {
                 XposedHelpers.findAndHookMethod("java.time.ZoneId", null, "systemDefault", new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        refreshConfig(false);
-                        if (enabled) param.setResult(java.time.ZoneId.of(tzId));
+                        ConfigSnapshot snap = getConfig();
+                        if (snap.enabled && snap.zoneId != null) {
+                            param.setResult(snap.zoneId);
+                        }
                     }
                 });
             }
@@ -220,8 +284,8 @@ public class MainHook implements IXposedHookLoadPackage {
                 XC_MethodHook hook = new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        refreshConfig(false);
-                        if (enabled) param.setResult(spoofLocale);
+                        ConfigSnapshot snap = getConfig();
+                        if (snap.enabled) param.setResult(snap.locale);
                     }
                 };
                 XposedHelpers.findAndHookMethod(Locale.class, "getDefault", hook);
@@ -237,8 +301,8 @@ public class MainHook implements IXposedHookLoadPackage {
                 XC_MethodHook hook = new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        refreshConfig(false);
-                        if (enabled) param.setResult(new LocaleList(spoofLocale));
+                        ConfigSnapshot snap = getConfig();
+                        if (snap.enabled) param.setResult(snap.localeList);
                     }
                 };
                 XposedHelpers.findAndHookMethod(LocaleList.class, "getDefault", hook);
@@ -248,21 +312,26 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private void hookConfiguration() {
-        safe("Configuration", new Runnable() {
+        safe("Resources.getConfiguration", new Runnable() {
             @Override
             public void run() {
                 XposedHelpers.findAndHookMethod(Resources.class, "getConfiguration", new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        refreshConfig(false);
-                        if (enabled) applyConfig((Configuration) param.getResult());
+                        ConfigSnapshot snap = getConfig();
+                        if (!snap.enabled) return;
+                        Configuration orig = (Configuration) param.getResult();
+                        if (orig == null) return;
+                        // 返回副本而非原地修改系统共享 Configuration，避免关闭伪装后残留脏值
+                        Configuration copy = new Configuration(orig);
+                        applyConfig(copy, snap);
+                        param.setResult(copy);
                     }
                 });
             }
         });
     }
 
-    /** per-app 语言常见路径：AppCompat/系统会 createConfigurationContext 覆盖区域设置 */
     private void hookConfigurationContext() {
         safe("createConfigurationContext", new Runnable() {
             @Override
@@ -272,9 +341,11 @@ public class MainHook implements IXposedHookLoadPackage {
                         new XC_MethodHook() {
                             @Override
                             protected void beforeHookedMethod(MethodHookParam param) {
-                                refreshConfig(false);
-                                if (enabled && param.args.length > 0) {
-                                    applyConfig((Configuration) param.args[0]);
+                                ConfigSnapshot snap = getConfig();
+                                if (snap.enabled && param.args.length > 0 && param.args[0] instanceof Configuration) {
+                                    Configuration copy = new Configuration((Configuration) param.args[0]);
+                                    applyConfig(copy, snap);
+                                    param.args[0] = copy;
                                 }
                             }
                         });
@@ -282,7 +353,6 @@ public class MainHook implements IXposedHookLoadPackage {
         });
     }
 
-    /** 直接拦 Configuration.getLocales，任何 Configuration 对象都返回伪装语言 */
     private void hookConfigGetLocales() {
         safe("Configuration.getLocales", new Runnable() {
             @Override
@@ -290,17 +360,14 @@ public class MainHook implements IXposedHookLoadPackage {
                 XposedHelpers.findAndHookMethod(Configuration.class, "getLocales", new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        refreshConfig(false);
-                        if (!enabled) return;
-                        param.setResult(new LocaleList(spoofLocale));
-                        debugLocales(param);
+                        ConfigSnapshot snap = getConfig();
+                        if (snap.enabled) param.setResult(snap.localeList);
                     }
                 });
             }
         });
     }
 
-    /** Android 13+ per-app 语言 & AndroidX AppCompat 存储的应用语言 */
     private void hookPerAppLocales() {
         safe("LocaleManager", new Runnable() {
             @Override
@@ -310,8 +377,8 @@ public class MainHook implements IXposedHookLoadPackage {
                 XC_MethodHook hook = new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        refreshConfig(false);
-                        if (enabled) param.setResult(new LocaleList(spoofLocale));
+                        ConfigSnapshot snap = getConfig();
+                        if (snap.enabled) param.setResult(snap.localeList);
                     }
                 };
                 XposedHelpers.findAndHookMethod(lm, "getApplicationLocales", hook);
@@ -327,14 +394,14 @@ public class MainHook implements IXposedHookLoadPackage {
                 XposedHelpers.findAndHookMethod(acd, "getApplicationLocales", new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        refreshConfig(false);
-                        if (!enabled) return;
+                        ConfigSnapshot snap = getConfig();
+                        if (!snap.enabled) return;
                         try {
                             Class<?> llc = XposedHelpers.findClassIfExists(
                                     "androidx.core.os.LocaleListCompat", appClassLoader);
                             if (llc != null) {
                                 Object list = llc.getMethod("create", Locale[].class)
-                                        .invoke(null, (Object) new Locale[]{spoofLocale});
+                                        .invoke(null, (Object) new Locale[]{snap.locale});
                                 param.setResult(list);
                             }
                         } catch (Throwable ignored) {
@@ -345,16 +412,18 @@ public class MainHook implements IXposedHookLoadPackage {
         });
     }
 
-    private void applyConfig(Configuration c) {
+    private void applyConfig(Configuration c, ConfigSnapshot snap) {
         if (c == null) return;
         try {
-            c.setLocales(new LocaleList(spoofLocale));
+            c.setLocales(snap.localeList);
         } catch (Throwable ignored) {
         }
         try {
-            XposedHelpers.setObjectField(c, "locale", spoofLocale);
+            XposedHelpers.setObjectField(c, "locale", snap.locale);
         } catch (Throwable ignored) {
         }
+        if (snap.mcc > 0) c.mcc = snap.mcc;
+        if (snap.mnc > 0) c.mnc = snap.mnc;
     }
 
     private void hookIcu() {
@@ -364,10 +433,8 @@ public class MainHook implements IXposedHookLoadPackage {
                 XposedHelpers.findAndHookMethod("android.icu.util.TimeZone", null, "getDefault", new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        refreshConfig(false);
-                        if (enabled) {
-                            param.setResult(android.icu.util.TimeZone.getTimeZone(tzId));
-                        }
+                        ConfigSnapshot snap = getConfig();
+                        if (snap.enabled) param.setResult(snap.icuTimeZone.clone());
                     }
                 });
             }
@@ -375,28 +442,19 @@ public class MainHook implements IXposedHookLoadPackage {
         safe("icu.ULocale", new Runnable() {
             @Override
             public void run() {
-                XposedHelpers.findAndHookMethod("android.icu.util.ULocale", null, "getDefault", new XC_MethodHook() {
+                Class<?> uLocaleClass = XposedHelpers.findClassIfExists("android.icu.util.ULocale", null);
+                if (uLocaleClass == null) return;
+                XposedBridge.hookAllMethods(uLocaleClass, "getDefault", new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        refreshConfig(false);
-                        if (enabled) {
-                            param.setResult(android.icu.util.ULocale.forLocale(spoofLocale));
-                        }
+                        ConfigSnapshot snap = getConfig();
+                        if (snap.enabled) param.setResult(snap.icuLocale);
                     }
                 });
             }
         });
     }
 
-    /**
-     * v1.5：TelephonyManager 运营商 / SIM 元数据伪装。
-     * 依据对 Claude 1.261109.19 的静态分析，以下接口有真实调用并进入网络请求：
-     *  - getSimCountryIso / getNetworkCountryIso → Sift mobile_iso_country_code、Claude network_country
-     *  - getNetworkOperatorName（及 getSimOperatorName）→ Sift mobile_carrier_name
-     *  - getSimOperator / getNetworkOperator → Google CCT mcc_mnc、Plaid mcc/mnc
-     *  - getSimCarrierId / getSimCarrierIdName → 网络监测对象
-     * 不涉及 IMSI / ICCID / 手机号（APK 未申请相应权限，也未发现读取代码）。
-     */
     private void hookTelephonyManager() {
         safe("TelephonyManager", new Runnable() {
             @Override
@@ -404,47 +462,102 @@ public class MainHook implements IXposedHookLoadPackage {
                 XC_MethodHook isoHook = new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        refreshConfig(false);
-                        if (enabled) param.setResult(carrierCountry);
+                        ConfigSnapshot snap = getConfig();
+                        // Android 标准 API 返回小写 ISO-3166 alpha-2 国家码（如 "us", "gb"）
+                        if (snap.enabled) param.setResult(snap.countryLower);
                     }
                 };
                 XC_MethodHook operatorHook = new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        refreshConfig(false);
-                        if (enabled) param.setResult(mccMnc);
+                        ConfigSnapshot snap = getConfig();
+                        if (snap.enabled) param.setResult(snap.mccMnc);
                     }
                 };
                 XC_MethodHook carrierNameHook = new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        refreshConfig(false);
-                        if (enabled) param.setResult(carrierName);
+                        ConfigSnapshot snap = getConfig();
+                        if (snap.enabled) param.setResult(snap.carrierName);
                     }
                 };
-                XposedHelpers.findAndHookMethod(android.telephony.TelephonyManager.class,
-                        "getSimCountryIso", isoHook);
-                XposedHelpers.findAndHookMethod(android.telephony.TelephonyManager.class,
-                        "getNetworkCountryIso", isoHook);
-                XposedHelpers.findAndHookMethod(android.telephony.TelephonyManager.class,
-                        "getSimOperator", operatorHook);
-                XposedHelpers.findAndHookMethod(android.telephony.TelephonyManager.class,
-                        "getNetworkOperator", operatorHook);
-                XposedHelpers.findAndHookMethod(android.telephony.TelephonyManager.class,
-                        "getSimOperatorName", carrierNameHook);
-                XposedHelpers.findAndHookMethod(android.telephony.TelephonyManager.class,
-                        "getNetworkOperatorName", carrierNameHook);
+                // 使用 hookAllMethods 同时覆盖 0 参和双卡 int slotIndex/subId 重载
+                XposedBridge.hookAllMethods(TelephonyManager.class, "getSimCountryIso", isoHook);
+                XposedBridge.hookAllMethods(TelephonyManager.class, "getNetworkCountryIso", isoHook);
+                XposedBridge.hookAllMethods(TelephonyManager.class, "getSimOperator", operatorHook);
+                XposedBridge.hookAllMethods(TelephonyManager.class, "getNetworkOperator", operatorHook);
+                XposedBridge.hookAllMethods(TelephonyManager.class, "getSimOperatorName", carrierNameHook);
+                XposedBridge.hookAllMethods(TelephonyManager.class, "getNetworkOperatorName", carrierNameHook);
                 if (Build.VERSION.SDK_INT >= 29) {
-                    XposedHelpers.findAndHookMethod(android.telephony.TelephonyManager.class,
-                            "getSimCarrierId", new XC_MethodHook() {
-                                @Override
-                                protected void afterHookedMethod(MethodHookParam param) {
-                                    refreshConfig(false);
-                                    if (enabled) param.setResult(carrierId);
-                                }
-                            });
-                    XposedHelpers.findAndHookMethod(android.telephony.TelephonyManager.class,
-                            "getSimCarrierIdName", carrierNameHook);
+                    XposedBridge.hookAllMethods(TelephonyManager.class, "getSimCarrierId", new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            ConfigSnapshot snap = getConfig();
+                            if (snap.enabled) param.setResult(snap.carrierId);
+                        }
+                    });
+                    XposedBridge.hookAllMethods(TelephonyManager.class, "getSimCarrierIdName", carrierNameHook);
+                }
+            }
+        });
+    }
+
+    private void hookSubscriptionInfo() {
+        safe("SubscriptionInfo", new Runnable() {
+            @Override
+            public void run() {
+                XposedBridge.hookAllMethods(SubscriptionInfo.class, "getCountryIso", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        ConfigSnapshot snap = getConfig();
+                        if (snap.enabled) param.setResult(snap.countryLower);
+                    }
+                });
+                XC_MethodHook nameHook = new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        ConfigSnapshot snap = getConfig();
+                        if (snap.enabled) param.setResult(snap.carrierName);
+                    }
+                };
+                XposedBridge.hookAllMethods(SubscriptionInfo.class, "getCarrierName", nameHook);
+                XposedBridge.hookAllMethods(SubscriptionInfo.class, "getDisplayName", nameHook);
+                XposedBridge.hookAllMethods(SubscriptionInfo.class, "getMcc", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        ConfigSnapshot snap = getConfig();
+                        if (snap.enabled && snap.mcc > 0) param.setResult(snap.mcc);
+                    }
+                });
+                XposedBridge.hookAllMethods(SubscriptionInfo.class, "getMnc", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        ConfigSnapshot snap = getConfig();
+                        if (snap.enabled && snap.mnc > 0) param.setResult(snap.mnc);
+                    }
+                });
+                if (Build.VERSION.SDK_INT >= 29) {
+                    XposedBridge.hookAllMethods(SubscriptionInfo.class, "getMccString", new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            ConfigSnapshot snap = getConfig();
+                            if (snap.enabled && !snap.mccStr.isEmpty()) param.setResult(snap.mccStr);
+                        }
+                    });
+                    XposedBridge.hookAllMethods(SubscriptionInfo.class, "getMncString", new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            ConfigSnapshot snap = getConfig();
+                            if (snap.enabled && !snap.mncStr.isEmpty()) param.setResult(snap.mncStr);
+                        }
+                    });
+                    XposedBridge.hookAllMethods(SubscriptionInfo.class, "getCarrierId", new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            ConfigSnapshot snap = getConfig();
+                            if (snap.enabled) param.setResult(snap.carrierId);
+                        }
+                    });
                 }
             }
         });
@@ -459,10 +572,35 @@ public class MainHook implements IXposedHookLoadPackage {
                 XposedBridge.hookAllMethods(sp, "get", new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        refreshConfig(false);
-                        if (enabled && param.args.length > 0
-                                && "persist.sys.timezone".equals(param.args[0])) {
-                            param.setResult(tzId);
+                        if (param.args.length == 0 || !("persist.sys.timezone".equals(param.args[0]))) return;
+                        ConfigSnapshot snap = getConfig();
+                        if (snap.enabled) param.setResult(snap.tzId);
+                    }
+                });
+            }
+        });
+    }
+
+    private void hookSystemGetProperty() {
+        safe("System.getProperty", new Runnable() {
+            @Override
+            public void run() {
+                XposedBridge.hookAllMethods(System.class, "getProperty", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        if (param.args.length == 0 || !(param.args[0] instanceof String)) return;
+                        String key = (String) param.args[0];
+                        if ("user.timezone".equals(key)) {
+                            ConfigSnapshot snap = getConfig();
+                            if (snap.enabled) param.setResult(snap.tzId);
+                        } else if ("user.language".equals(key)) {
+                            ConfigSnapshot snap = getConfig();
+                            if (snap.enabled) param.setResult(snap.locale.getLanguage());
+                        } else if ("user.country".equals(key) || "user.region".equals(key)) {
+                            ConfigSnapshot snap = getConfig();
+                            if (snap.enabled && !snap.locale.getCountry().isEmpty()) {
+                                param.setResult(snap.locale.getCountry());
+                            }
                         }
                     }
                 });

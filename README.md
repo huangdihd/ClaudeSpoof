@@ -12,9 +12,9 @@
 
 | 平台 | 当前版本 | 实现方式 | 官方客户端文件 | 详细说明 |
 | --- | --- | --- | --- | --- |
-| Android | 1.5.1 | LSPosed hook Android 系统时区、locale 与运营商 API | 不修改 | [android/README.md](android/README.md) |
-| macOS | 2.1.0 | 同名外壳接管原入口，LaunchServices `open --env` 传 `TZ` 与 Chromium `--lang` | 不修改 | [macos/README.md](macos/README.md) |
-| Windows | 1.1.0 | 官方进程内存启用临时调试入口，行为特征动态注入、校验与更新守护 | 不修改 | [windows/README.md](windows/README.md) |
+| Android | 1.6.0 | LSPosed 无锁不可变快照 + Native `TZ` + 系统时区/locale/运营商/双卡 API Hook | 不修改 | [android/README.md](android/README.md) |
+| macOS | 2.2.0 | 独立 Bundle ID 原生 Swift/Zsh 外壳（支持 `claude://`），`open --env` + `-AppleLanguages`/`-AppleLocale` + LaunchAgent 守护 | 不修改 | [macos/README.md](macos/README.md) |
+| Windows | 1.2.0 | 官方进程动态端口内存注入、定向 Cowork 管道分片拦截、`session.webRequest` 覆盖与互斥防抖更新守护 | 不修改 | [windows/README.md](windows/README.md) |
 
 ## 快速开始
 
@@ -52,9 +52,9 @@ Windows 版只在本次启动的新进程内工作，不写回官方 EXE／ASAR�
 
 三客户端汇总 Release 提供：
 
-- `ClaudeSpoof-v1.5.1.apk`：Android 安装包。
-- `ClaudeSpoof-macOS-v2.1.0.zip`：macOS 官方签名环境启动器、配置与文档。
-- `ClaudeSpoof-Windows-v1.1.0.zip`：Windows 启动器、完整源码、配置与文档。
+- `ClaudeSpoof-v1.6.0.apk`：Android 安装包。
+- `ClaudeSpoof-macOS-v2.2.0.zip`：macOS 官方签名环境启动器（含原生 Swift 外壳与 LaunchAgent 支持）、配置与文档。
+- `ClaudeSpoof-Windows-v1.2.0.zip`：Windows 启动器、完整源码、配置、测试与文档。
 - `SHA256SUMS.txt`：桌面压缩包及 Android APK 的 SHA-256。
 
 源码仓库不保存 Claude 官方安装包、ASAR、账号数据、Cookie、token、MCP 密钥或本机验证日志。

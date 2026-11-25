@@ -9,6 +9,22 @@ const { loadConfig, stateHome, readJson, writeJson } = require('./config');
 const ANTHROPIC_TEAM_ID = 'Q6L2SF6YDW';
 const HARDWARE_KEY_GROUP = `${ANTHROPIC_TEAM_ID}.com.anthropic.claude.hwkey`;
 
+const SCRIPT_OR_LANG_TO_POSIX = Object.freeze({
+  'zh-hans': 'zh_CN',
+  'zh-hant': 'zh_TW',
+  zh: 'zh_CN',
+  en: 'en_US',
+  ja: 'ja_JP',
+  ko: 'ko_KR',
+  fr: 'fr_FR',
+  de: 'de_DE',
+  es: 'es_ES',
+  pt: 'pt_BR',
+  it: 'it_IT',
+  nl: 'nl_NL',
+  ru: 'ru_RU',
+});
+
 function executablePath(appPath) {
   const root = path.resolve(appPath);
   const plist = path.join(root, 'Contents', 'Info.plist');
@@ -23,32 +39,67 @@ function executablePath(appPath) {
   return result;
 }
 
+function appleLocaleValue(language) {
+  const clean = String(language || '').trim();
+  const lower = clean.toLowerCase();
+  if (SCRIPT_OR_LANG_TO_POSIX[lower]) {
+    return SCRIPT_OR_LANG_TO_POSIX[lower];
+  }
+  const parts = clean.split('-').filter(Boolean);
+  if (parts.length >= 2) {
+    const lang = parts[0].toLowerCase();
+    const region = parts.slice(1).find((part) => /^[A-Za-z]{2}$/.test(part));
+    if (region) {
+      return `${lang}_${region.toUpperCase()}`;
+    }
+    const langScript = `${lang}-${parts[1].toLowerCase()}`;
+    if (SCRIPT_OR_LANG_TO_POSIX[langScript]) {
+      return SCRIPT_OR_LANG_TO_POSIX[langScript];
+    }
+  }
+  return clean.replace(/-/g, '_');
+}
+
 function languageEnvironment(language) {
-  return `${language.replace('-', '_')}.UTF-8`;
+  return `${appleLocaleValue(language)}.UTF-8`;
 }
 
 function launchArguments(config, extraArguments = []) {
+  const filtered = [];
+  for (let i = 0; i < extraArguments.length; i += 1) {
+    const arg = String(extraArguments[i]);
+    if (/^--lang=/i.test(arg)) continue;
+    if (arg === '-AppleLanguages' || arg === '-AppleLocale') {
+      i += 1;
+      continue;
+    }
+    filtered.push(arg);
+  }
   return [
     `--lang=${config.language}`,
-    ...extraArguments.filter((arg) => !/^--lang=/i.test(String(arg))),
+    '-AppleLanguages', `("${config.language}")`,
+    '-AppleLocale', appleLocaleValue(config.language),
+    ...filtered,
   ];
 }
 
 function openEnvironmentArgs(config) {
+  const posix = languageEnvironment(config.language);
   return [
     '--env', `TZ=${config.timezone}`,
-    '--env', `LANG=${languageEnvironment(config.language)}`,
-    '--env', `LC_ALL=${languageEnvironment(config.language)}`,
+    '--env', `LANG=${posix}`,
+    '--env', `LC_ALL=${posix}`,
     '--env', `LANGUAGE=${config.language}`,
   ];
 }
 
 function launchEnvironment(config, source = process.env) {
+  const posix = languageEnvironment(config.language);
   const environment = {
     ...source,
     TZ: config.timezone,
-    LANG: languageEnvironment(config.language),
-    LC_ALL: languageEnvironment(config.language),
+    LANG: posix,
+    LC_ALL: posix,
     LANGUAGE: config.language,
   };
   delete environment.ELECTRON_RUN_AS_NODE;
@@ -87,20 +138,42 @@ function verifyOfficialSignature(appPath) {
   };
 }
 
+function pgrepUserArgs() {
+  const args = [];
+  if (typeof process.getuid === 'function') {
+    args.push('-u', String(process.getuid()));
+  }
+  args.push('-x', 'Claude');
+  return args;
+}
+
+function listClaudePids() {
+  const result = spawnSync('/usr/bin/pgrep', pgrepUserArgs(), { encoding: 'utf8' });
+  if (result.status !== 0) return [];
+  return String(result.stdout || '').trim().split('\n')
+    .map((value) => Number(value))
+    .filter((pid) => Number.isInteger(pid) && pid > 0);
+}
+
 function isClaudeRunning() {
-  const result = spawnSync('/usr/bin/pgrep', ['-x', 'Claude'], { stdio: 'ignore' });
-  return result.status === 0;
+  return listClaudePids().length > 0;
+}
+
+function processExecutable(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const result = spawnSync('/bin/ps', ['-p', String(pid), '-o', 'comm='], { encoding: 'utf8' });
+  if (result.status !== 0) return null;
+  return result.stdout.trim() || null;
 }
 
 function isPidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  const result = spawnSync('/bin/ps', ['-p', String(pid), '-o', 'comm='], { encoding: 'utf8' });
-  return result.status === 0 && result.stdout.trim().endsWith('/Claude');
+  const comm = processExecutable(pid);
+  return Boolean(comm && comm.endsWith('/Claude'));
 }
 
 function assertNotRunning() {
   if (isClaudeRunning()) {
-    const error = new Error('Claude 已在运行，无法确认它是否继承英国环境。请先完全退出，再由本启动器打开。');
+    const error = new Error('Claude 已在运行，无法确认它是否继承配置的环境。请先完全退出，再由本启动器打开。');
     error.code = 'CLAUDE_RUNNING';
     throw error;
   }
@@ -116,26 +189,40 @@ function ensureWatcher(watcherApp) {
   return ensureUpdateWatcher({ app: watcherApp || '/Applications/Claude.app' });
 }
 
-function activateManagedRunning(appPath) {
+function activatePid(pid) {
+  const result = spawnSync('/usr/bin/osascript', [
+    '-e', `tell application "System Events" to set frontmost of (first process whose unix id is ${pid}) to true`,
+  ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  return result.status === 0;
+}
+
+function activateManagedRunning(appPath, extraArguments = []) {
   const state = readJson(runtimeStatePath(), null);
   const root = path.resolve(appPath);
   if (!state || state.running !== true || state.appPath !== root || !isPidAlive(state.pid)) return false;
-  const result = spawnSync('/usr/bin/osascript', [
-    '-e', 'tell application id "com.anthropic.claudefordesktop" to activate',
-  ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-  if (result.status !== 0) throw new Error('Claude 已在运行，但激活现有窗口失败');
+  if (!activatePid(state.pid)) {
+    // Fallback to open -a <realPath> which routes cleanly to the specific bundle path.
+    const fallback = spawnSync('/usr/bin/open', ['-a', root], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    if (fallback.status !== 0) throw new Error('Claude 已在运行，但激活现有窗口失败');
+  }
+  const urlArgs = extraArguments.filter((arg) => /^claude:\/\//i.test(String(arg)));
+  if (urlArgs.length > 0) {
+    spawnSync('/usr/bin/open', ['-a', root, ...urlArgs], { stdio: 'ignore' });
+  }
   const watcher = ensureWatcher(state.watcherApp);
   console.log(`[ClaudeSpoof] 已激活由启动器管理的 Claude（pid=${state.pid}）`);
   return { activated: true, watcher };
 }
 
-function findClaudePid(timeoutMs = 15000) {
+function findClaudePid(expectedExecutable = null, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
+  const resolvedExpected = expectedExecutable ? path.resolve(expectedExecutable) : null;
   while (Date.now() < deadline) {
-    const result = spawnSync('/usr/bin/pgrep', ['-x', 'Claude'], { encoding: 'utf8' });
-    if (result.status === 0) {
-      const pid = Number(String(result.stdout).trim().split('\n')[0]);
-      if (Number.isInteger(pid) && pid > 0) return pid;
+    const pids = listClaudePids();
+    for (const pid of pids) {
+      if (!resolvedExpected) return pid;
+      const comm = processExecutable(pid);
+      if (comm && path.resolve(comm) === resolvedExpected) return pid;
     }
     spawnSync('/bin/sleep', ['0.5'], { stdio: 'ignore' });
   }
@@ -145,14 +232,20 @@ function findClaudePid(timeoutMs = 15000) {
 function startEnvironment(options = {}) {
   if (process.platform !== 'darwin') throw new Error('官方环境启动器只能在 macOS 上使用');
   const config = loadConfig();
-  if (!config.enabled) throw new Error('ClaudeSpoof 配置已停用，拒绝未伪装启动');
+  if (!config.enabled) {
+    const error = new Error('ClaudeSpoof 配置已停用（enabled=false）。如需临时使用真实环境，请先启用或移除原入口接管。');
+    error.code = 'CLAUDE_SPOOF_DISABLED';
+    throw error;
+  }
   const appPath = path.resolve(options.app || '/Applications/Claude.app');
   const watcherApp = path.resolve(options.watcherApp || '/Applications/Claude.app');
   const signature = verifyOfficialSignature(appPath);
+  const expectedExec = executablePath(appPath);
+  const extraArguments = options.extraArguments || [];
   if (!options.skipProcessCheck) {
     if (isClaudeRunning()) {
       if (options.activateIfManaged) {
-        const activated = activateManagedRunning(appPath);
+        const activated = activateManagedRunning(appPath, extraArguments);
         if (activated) {
           const state = readJson(runtimeStatePath(), null);
           return {
@@ -169,16 +262,19 @@ function startEnvironment(options = {}) {
     }
   }
   const stateFile = runtimeStatePath();
+  const urlArgs = extraArguments.filter((arg) => /^claude:\/\//i.test(String(arg)));
+  const nonUrlArgs = extraArguments.filter((arg) => !/^claude:\/\//i.test(String(arg)));
   const args = [
     ...openEnvironmentArgs(config),
     appPath,
+    ...urlArgs,
     '--args',
-    ...launchArguments(config, options.extraArguments || []),
+    ...launchArguments(config, nonUrlArgs),
   ];
   const opened = spawnSync('/usr/bin/open', args, { stdio: 'inherit' });
   if (opened.error) throw opened.error;
   if (opened.status !== 0) throw new Error(`open 启动失败（exit ${opened.status}）`);
-  const pid = findClaudePid();
+  const pid = findClaudePid(expectedExec);
   if (!pid) throw new Error('Claude 未能通过 LaunchServices 启动');
   writeJson(stateFile, {
     running: true,
@@ -201,11 +297,13 @@ module.exports = {
   ANTHROPIC_TEAM_ID,
   HARDWARE_KEY_GROUP,
   executablePath,
+  appleLocaleValue,
   languageEnvironment,
   launchArguments,
   launchEnvironment,
   openEnvironmentArgs,
   verifyOfficialSignature,
+  listClaudePids,
   isClaudeRunning,
   isPidAlive,
   findClaudePid,

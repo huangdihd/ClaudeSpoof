@@ -111,6 +111,7 @@ AT&T=1187）；「自定义」预设返回 `-1`（unknown），与未收录运�
 
 ## 版本历史
 
+- **v1.6.0**：无锁不可变 `ConfigSnapshot` + 后台单线程异步刷新（消除 UI 线程阻塞与锁竞争）；修复 `XSharedPreferences` 无权限假成功导致 `ContentProvider` 回退失效；`ConfigProvider` 增加 `Binder.getCallingUid()` 白名单校验；新增 `Os.setenv("TZ", ...)` 覆盖 Native / WebView 时区；补全 `TimeZone.getDefaultRef()`、`ULocale.getDefault(Category)`、`System.getProperty`、双卡 `TelephonyManager` 重载、`SubscriptionInfo` 与 `Configuration.mcc`/`mnc`；国家码改为标准小写；不再原地篡改共享 `Configuration`；修复 `MainActivity` 时区校验、手动编辑重置 `carrierId` 与同步 `commit()` 落盘。
 - **v1.5.1**：新增 EE / Vodafone / O2 / Three 英国运营商预设。
 - **v1.5.0**：运营商 / SIM 元数据伪装（TelephonyManager 八个接口），运营商预设下拉（Verizon / T-Mobile / AT&T / DoCoMo / SoftBank），依据 1.261109.19 静态分析覆盖 Sift / Plaid / CCT / ReportDeviceFacts 数据源。
 - **v1.4.1**：新 LOGO——戴上假鼻子胡子墨镜的橙色太阳花（自适应图标，Android 12+ 随主题取色）。
