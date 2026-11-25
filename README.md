@@ -13,7 +13,7 @@
 | 平台 | 当前版本 | 实现方式 | 官方客户端文件 | 详细说明 |
 | --- | --- | --- | --- | --- |
 | Android | 1.5.1 | LSPosed hook Android 系统时区、locale 与运营商 API | 不修改 | [android/README.md](android/README.md) |
-| macOS | 2.0.0 | 同名外壳接管原入口，LaunchServices `open --env` 传 `TZ` 与 Chromium `--lang` | 不修改 | [macos/README.md](macos/README.md) |
+| macOS | 2.1.0 | 同名外壳接管原入口，LaunchServices `open --env` 传 `TZ` 与 Chromium `--lang` | 不修改 | [macos/README.md](macos/README.md) |
 | Windows | 1.1.0 | 官方进程内存启用临时调试入口，行为特征动态注入、校验与更新守护 | 不修改 | [windows/README.md](windows/README.md) |
 
 ## 快速开始
@@ -36,7 +36,7 @@ zsh 接管\ Claude\ 原入口.command
 node src/cli.js install-wrapper
 ```
 
-接管后，启动台、Dock、聚焦里的 Claude 原入口照常使用，进程与窗口名仍是 Claude；真正的官方 App 原样保留在隐藏的 `.ClaudeSpoof` 目录中。外壳只负责通过 LaunchServices 以 `TZ`／`--lang` 环境启动官方 App，不修改 ASAR、不重签、不看门狗。恢复时运行 `node src/cli.js remove-wrapper`。详见 [macOS 文档](macos/README.md)。
+接管后，启动台、Dock、聚焦里的 Claude 原入口照常使用，进程与窗口名仍是 Claude；真正的官方 App 原样保留在隐藏的 `.ClaudeSpoof` 目录中。外壳通过 LaunchServices 以 `TZ`／`--lang` 环境启动官方 App，不修改 ASAR、不重签。轻量守护检查真实进程环境，处理官方直启及外壳被更新覆盖；手动退出不会主动拉起，修复失败会退避。已有安装可运行 `node src/cli.js refresh` 无重启升级守护，恢复时运行 `node src/cli.js remove-wrapper`。详见 [macOS 文档](macos/README.md)。
 
 ### Windows
 
@@ -53,7 +53,7 @@ Windows 版只在本次启动的新进程内工作，不写回官方 EXE／ASAR�
 三客户端汇总 Release 提供：
 
 - `ClaudeSpoof-v1.5.1.apk`：Android 安装包。
-- `ClaudeSpoof-macOS-v2.0.0.zip`：macOS 官方签名环境启动器、配置与文档。
+- `ClaudeSpoof-macOS-v2.1.0.zip`：macOS 官方签名环境启动器、配置与文档。
 - `ClaudeSpoof-Windows-v1.1.0.zip`：Windows 启动器、完整源码、配置与文档。
 - `SHA256SUMS.txt`：桌面压缩包及 Android APK 的 SHA-256。
 
@@ -72,7 +72,7 @@ LICENSE     GPL-3.0-or-later
 ## 验证与兼容边界
 
 - Android 主要 hook 系统 API，通常不依赖 Claude 混淆类名。
-- macOS 已在 Electron 45.3.3 上验证 Renderer 继承 `TZ` 与 `--lang`；真实客户端的设备密钥、会话关联和附加文件夹也已实测。接管后从原入口启动即继承环境；直接打开隐藏目录里的官方 App 不会继承。
+- macOS 已在 Electron 45.3.3 上验证 Renderer 继承 `TZ` 与 `--lang`；真实客户端的主进程环境、设备密钥、会话关联和附加文件夹也已实测。接管后从原入口启动即继承环境；直接打开隐藏目录里的官方 App 时，运行中的守护会识别并修复，守护未启动或已停止则不会继承。
 - Windows 当前针对 Claude 7.37095.0.0 验证；共享模块按行为特征定位，行为实现变化会触发失败保护，需要更新适配。
 - Windows VM 覆盖针对由 Claude VM client 创建的进程；不会修改 VM 的 `/etc/localtime`、`/etc/timezone` 或独立系统服务。
 - 时区、语言、运营商只是环境信号的一部分；出口 IP、账号资料、支付信息等仍可能独立存在。

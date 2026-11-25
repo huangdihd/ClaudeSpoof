@@ -10,8 +10,9 @@ const {
   assertNotRunning,
 } = require('./environment');
 
-const WRAPPER_VERSION = 1;
+const WRAPPER_VERSION = 2;
 const MARKER_NAME = 'ClaudeSpoofEnvironment.json';
+const HELPER_MODULES = ['config.js', 'environment.js', 'wrapper.js', 'watcher.js'];
 
 function xml(value) {
   return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;')
@@ -60,13 +61,12 @@ function plistValue(appPath, key) {
 
 function copyHelpers() {
   fs.mkdirSync(helperDir(), { recursive: true, mode: 0o700 });
-  for (const name of ['config.js', 'environment.js']) {
+  for (const name of HELPER_MODULES) {
     fs.copyFileSync(path.join(__dirname, name), path.join(helperDir(), name));
   }
   const launcher = `#!/usr/bin/env node
 'use strict';
 
-const fs = require('node:fs');
 const path = require('node:path');
 
 const app = process.argv[2];
@@ -76,28 +76,57 @@ if (!app) {
   process.exit(2);
 }
 
+const watcherApp = process.env.CLAUDE_SPOOF_WATCHER_APP || '/Applications/Claude.app';
+const helperSource = process.env.CLAUDE_SPOOF_HELPER_SOURCE;
 // 每次启动先从安装来源刷新 helper，避免仓库更新后 bin 里残留旧代码
-try {
-  const marker = JSON.parse(fs.readFileSync(path.join(app, 'Contents', 'Resources', '${MARKER_NAME}'), 'utf8'));
-  if (marker.helperSource) {
-    for (const name of ['config.js', 'environment.js']) {
-      fs.copyFileSync(path.join(marker.helperSource, 'src', name), path.join(__dirname, name));
+if (helperSource) {
+  try {
+    for (const name of ${JSON.stringify(HELPER_MODULES)}) {
+      require('node:fs').copyFileSync(path.join(helperSource, 'src', name), path.join(__dirname, name));
     }
-  }
-} catch (_) {}
+  } catch (_) {}
+}
 
 const { startEnvironment } = require('./environment');
-startEnvironment({ app, activateIfManaged: true, extraArguments });
+startEnvironment({ app, watcherApp, activateIfManaged: true, extraArguments });
 `;
   fs.writeFileSync(helperPath(), launcher, { mode: 0o700 });
 }
 
-function wrapperShell(realPath) {
+function refreshWrapper(appPath) {
+  const root = path.resolve(appPath);
+  const info = wrapperInfo(root);
+  if (!info) throw new Error('该路径不是 ClaudeSpoof 环境启动器');
+  const realPath = path.resolve(info.realPath);
+  const helperSource = path.resolve(__dirname, '..');
+  verifyOfficialSignature(realPath);
+  copyHelpers();
+  // 只更新外层 shell 和 marker；官方 App、当前 Claude 进程及账号数据均不动。
+  fs.writeFileSync(
+    path.join(root, 'Contents', 'MacOS', 'ClaudeSpoof'),
+    wrapperShell(realPath, root, helperSource),
+    { mode: 0o755 },
+  );
+  writeJson(path.join(root, 'Contents', 'Resources', MARKER_NAME), {
+    ...info,
+    version: WRAPPER_VERSION,
+    appPath: root,
+    realPath,
+    helperPath: helperPath(),
+    helperSource,
+    refreshedAt: new Date().toISOString(),
+  });
+  return { status: 'refreshed', appPath: root, realPath, helperPath: helperPath() };
+}
+
+function wrapperShell(realPath, appPath, helperSource) {
   return `#!/bin/zsh
 set -euo pipefail
 CLAUDE_SPOOF_HOME="\${CLAUDE_SPOOF_HOME:-$HOME/Library/Application Support/ClaudeSpoof}"
 HELPER="\$CLAUDE_SPOOF_HOME/bin/launcher.js"
 REAL_APP=${JSON.stringify(path.resolve(realPath))}
+export CLAUDE_SPOOF_WATCHER_APP=${JSON.stringify(path.resolve(appPath))}
+export CLAUDE_SPOOF_HELPER_SOURCE=${JSON.stringify(path.resolve(helperSource))}
 NODE_BIN=""
 for candidate in /opt/homebrew/bin/node /usr/local/bin/node \$HOME/.nvm/versions/node/*/bin/node(N) /usr/bin/node; do
   if [[ -x \$candidate ]]; then
@@ -154,7 +183,11 @@ function createWrapperApp(appPath, realPath) {
   const iconSource = path.join(realRoot, 'Contents', 'Resources', iconName);
   if (fs.existsSync(iconSource)) fs.copyFileSync(iconSource, path.join(resources, iconName));
   fs.writeFileSync(path.join(contents, 'Info.plist'), wrapperInfoPlist(realRoot, iconName));
-  fs.writeFileSync(path.join(macos, 'ClaudeSpoof'), wrapperShell(realRoot), { mode: 0o755 });
+  fs.writeFileSync(
+    path.join(macos, 'ClaudeSpoof'),
+    wrapperShell(realRoot, root, path.resolve(__dirname, '..')),
+    { mode: 0o755 },
+  );
   writeJson(path.join(resources, MARKER_NAME), {
     kind: 'ClaudeSpoofEnvironment',
     version: WRAPPER_VERSION,
@@ -195,6 +228,36 @@ function installWrapper(appPath) {
   };
 }
 
+function repairWrapper(appPath) {
+  if (process.platform !== 'darwin') throw new Error('修复原入口只能在 macOS 上执行');
+  const root = path.resolve(appPath);
+  if (wrapperInfo(root)) throw new Error('该路径仍是 ClaudeSpoof 环境启动器，无需修复');
+  const realPath = defaultRealPath(root);
+  if (!fs.existsSync(realPath)) throw new Error(`未找到更新前的官方 App：${realPath}`);
+  verifyOfficialSignature(root);
+  assertNotRunning();
+
+  const backupDir = path.join(path.dirname(realPath), 'backups');
+  fs.mkdirSync(backupDir, { recursive: true, mode: 0o700 });
+  const backupPath = path.join(backupDir, `Claude-${Date.now()}-${process.pid}.app`);
+  fs.renameSync(realPath, backupPath);
+  let movedOfficial = false;
+  let temporaryPath = null;
+  try {
+    fs.renameSync(root, realPath);
+    movedOfficial = true;
+    temporaryPath = createWrapperApp(root, realPath);
+    copyHelpers();
+    fs.renameSync(temporaryPath, root);
+  } catch (error) {
+    if (temporaryPath) fs.rmSync(temporaryPath, { recursive: true, force: true });
+    if (movedOfficial && !fs.existsSync(root) && fs.existsSync(realPath)) fs.renameSync(realPath, root);
+    if (!fs.existsSync(realPath) && fs.existsSync(backupPath)) fs.renameSync(backupPath, realPath);
+    throw error;
+  }
+  return { status: 'repaired', appPath: root, realPath, backupPath, helperPath: helperPath() };
+}
+
 function removeWrapper(appPath) {
   if (process.platform !== 'darwin') throw new Error('移除原入口接管只能在 macOS 上执行');
   const root = path.resolve(appPath);
@@ -203,6 +266,8 @@ function removeWrapper(appPath) {
   const realPath = path.resolve(info.realPath);
   verifyOfficialSignature(realPath);
   assertNotRunning();
+  const { stopUpdateWatcher } = require('./watcher');
+  stopUpdateWatcher();
   const temporaryPath = path.join(path.dirname(root), `.ClaudeSpoof-remove-${process.pid}.app`);
   fs.rmSync(temporaryPath, { recursive: true, force: true });
   fs.renameSync(root, temporaryPath);
@@ -223,5 +288,7 @@ module.exports = {
   resolveAppPath,
   defaultRealPath,
   installWrapper,
+  refreshWrapper,
+  repairWrapper,
   removeWrapper,
 };

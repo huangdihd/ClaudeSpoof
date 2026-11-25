@@ -110,6 +110,12 @@ function runtimeStatePath() {
   return path.join(stateHome(), 'environment-launch.json');
 }
 
+function ensureWatcher(watcherApp) {
+  // 延迟加载，避免 environment / watcher / wrapper 之间形成初始化循环。
+  const { ensureUpdateWatcher } = require('./watcher');
+  return ensureUpdateWatcher({ app: watcherApp || '/Applications/Claude.app' });
+}
+
 function activateManagedRunning(appPath) {
   const state = readJson(runtimeStatePath(), null);
   const root = path.resolve(appPath);
@@ -118,8 +124,9 @@ function activateManagedRunning(appPath) {
     '-e', 'tell application id "com.anthropic.claudefordesktop" to activate',
   ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   if (result.status !== 0) throw new Error('Claude 已在运行，但激活现有窗口失败');
+  const watcher = ensureWatcher(state.watcherApp);
   console.log(`[ClaudeSpoof] 已激活由启动器管理的 Claude（pid=${state.pid}）`);
-  return true;
+  return { activated: true, watcher };
 }
 
 function findClaudePid(timeoutMs = 15000) {
@@ -140,12 +147,23 @@ function startEnvironment(options = {}) {
   const config = loadConfig();
   if (!config.enabled) throw new Error('ClaudeSpoof 配置已停用，拒绝未伪装启动');
   const appPath = path.resolve(options.app || '/Applications/Claude.app');
+  const watcherApp = path.resolve(options.watcherApp || '/Applications/Claude.app');
   const signature = verifyOfficialSignature(appPath);
   if (!options.skipProcessCheck) {
     if (isClaudeRunning()) {
-      if (options.activateIfManaged && activateManagedRunning(appPath)) {
-        const state = readJson(runtimeStatePath(), null);
-        return { pid: state ? state.pid : null, activated: true, config, signature, stateFile: runtimeStatePath() };
+      if (options.activateIfManaged) {
+        const activated = activateManagedRunning(appPath);
+        if (activated) {
+          const state = readJson(runtimeStatePath(), null);
+          return {
+            pid: state ? state.pid : null,
+            activated: true,
+            config,
+            signature,
+            stateFile: runtimeStatePath(),
+            watcher: activated.watcher,
+          };
+        }
       }
       assertNotRunning();
     }
@@ -166,6 +184,7 @@ function startEnvironment(options = {}) {
     running: true,
     pid,
     appPath,
+    watcherApp,
     timezone: config.timezone,
     language: config.language,
     mode: 'official-signature-environment',
@@ -173,8 +192,9 @@ function startEnvironment(options = {}) {
     signature,
     startedAt: new Date().toISOString(),
   });
+  const watcher = ensureWatcher(watcherApp);
   console.log(`[ClaudeSpoof] 官方签名环境已启动：${config.timezone} / ${config.language}（pid=${pid}）`);
-  return { pid, activated: false, config, signature, stateFile };
+  return { pid, activated: false, config, signature, stateFile, watcher };
 }
 
 module.exports = {

@@ -18,9 +18,18 @@ const {
 } = require('./environment');
 const {
   installWrapper,
+  refreshWrapper,
   removeWrapper,
   resolveAppPath,
 } = require('./wrapper');
+const {
+  watcherStatusPath,
+  inspectInstallation,
+  assertWatcherStartSafe,
+  ensureUpdateWatcher,
+  stopUpdateWatcher,
+  currentWatcherPid,
+} = require('./watcher');
 
 const LEGACY_AGENT_LABEL = 'com.arin.claudespoof.watch';
 
@@ -30,7 +39,10 @@ function usage() {
 用法：
   node src/cli.js install-wrapper [--app /Applications/Claude.app]
   node src/cli.js remove-wrapper [--app /Applications/Claude.app]
+  node src/cli.js refresh [--app /Applications/Claude.app]
   node src/cli.js start [--app /Applications/Claude.app]
+  node src/cli.js start-watcher [--app /Applications/Claude.app]
+  node src/cli.js stop-watcher
   node src/cli.js verify [--app /Applications/Claude.app]
   node src/cli.js status [--app /Applications/Claude.app]
   node src/cli.js config [--timezone Europe/London] [--language en-GB] [--enabled true|false]
@@ -38,6 +50,7 @@ function usage() {
 
 install-wrapper 会把官方 App 移到隐藏的 .ClaudeSpoof 目录，并在原路径保留同名、
 同图标的 Claude 启动入口；运行进程与窗口名称仍来自真正的官方 App。
+refresh 只刷新 helper 并启动／重载更新守护，不重启已经验证的 Claude。
 
 配置文件：${configPath()}
 `);
@@ -85,6 +98,12 @@ function uninstallLegacyAgent() {
   return { removed: true, path: plistPath };
 }
 
+function startWatcherSafely(appPath) {
+  const snapshot = assertWatcherStartSafe(appPath);
+  const watcher = ensureUpdateWatcher({ app: appPath });
+  return { snapshot, watcher };
+}
+
 function main() {
   const { command, options } = parse(process.argv.slice(2));
   if (command === 'help' || command === '--help' || command === '-h') return usage();
@@ -95,12 +114,23 @@ function main() {
     if (options.language !== undefined) patch.language = options.language;
     if (options.enabled !== undefined) patch.enabled = bool(options.enabled);
     const config = Object.keys(patch).length ? updateConfig(patch) : loadConfig();
-    console.log(`配置已保存到 ${configPath()}；完全退出并由原 Claude 入口重新打开后生效。`);
+    console.log(`配置已保存到 ${configPath()}；完全退出并由原 Claude 入口重新打开后生效。运行中的旧配置若不匹配，守护会请求正常退出并重开。`);
     return printResult(config);
   }
 
   if (command === 'install-wrapper') return printResult(installWrapper(options.app));
   if (command === 'remove-wrapper') return printResult(removeWrapper(options.app));
+  if (command === 'stop-watcher') return printResult(stopUpdateWatcher());
+
+  if (command === 'refresh') {
+    const refreshed = refreshWrapper(options.app);
+    const safe = assertWatcherStartSafe(options.app);
+    stopUpdateWatcher();
+    const watcher = ensureUpdateWatcher({ app: options.app });
+    return printResult({ ...refreshed, claudeAction: safe.action, watcher });
+  }
+
+  if (command === 'start-watcher') return printResult(startWatcherSafely(options.app));
 
   const appPath = resolveAppPath(options.app);
 
@@ -113,12 +143,18 @@ function main() {
       config: loadConfig(),
       official: verifyOfficialSignature(appPath),
       launch: readJson(runtimeStatePath(), null),
+      watcher: {
+        pid: currentWatcherPid(),
+        status: readJson(watcherStatusPath(), null),
+      },
+      inspection: inspectInstallation(options.app),
     });
   }
 
   if (command === 'start' || command === 'start-official') {
     const result = startEnvironment({
       app: appPath,
+      watcherApp: options.app,
       skipProcessCheck: options.skipProcessCheck,
     });
     return printResult({
@@ -128,6 +164,7 @@ function main() {
       timezone: result.config.timezone,
       language: result.config.language,
       signature: result.signature,
+      watcher: result.watcher,
     });
   }
 
